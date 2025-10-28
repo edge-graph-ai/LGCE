@@ -1,0 +1,104 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Hidden files
+.DS_Store
+Thumbs.db
+
+# Virtual environment
+.env/
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Python specific logs
+*.log
+*.out
+*.err
+
+# PyTorch / TensorFlow checkpoint files
+checkpoints/
+*.ckpt
+*.pth
+*.h5
+
+# Model weights
+*.weights
+*.onnx
+*.tflite
+*.rknn
+
+# Data files
+
+*.csv
+*.tsv
+*.json
+*.yaml
+
+# Generated or temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+
+# Experiment results
+*result*/
+*log*/
+*.tensorboard
+
+# Large binary files
+*.zip
+*.tar
+*.tar.gz
+*.rar
+
+# Images and videos
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+*.mp4
+*.avi
+*.mkv
+
+# Operating system-specific files
+*.swp
+*.swo
+*.~lock.*
+._*
+
+# IDE-specific files
+.vscode/
+.idea/
+*.iml
+
+# Test or cache files
+*.cache
+*.pytest_cache/
+tests/__pycache__/
+
+*ablation*/
+compare/
+data/
+*.graph
+*.txt
+*.pid
+*.out
+
+
+*.pdf
+*.svg
+*.sh
