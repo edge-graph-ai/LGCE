@@ -693,6 +693,7 @@ def model_forward_log1p_pred(model: GraphCardinalityEstimatorMultiSubgraph,
             toks = [torch.zeros(1, model.cls_token.shape[-1], device=device, dtype=dtype)]
         seq = torch.cat(toks, dim=0)
         if hasattr(model, "apply_memory_positional_encoding"):
+            # 与主训练脚本保持一致：让记忆 token 叠加位置编码后再进入 encoder
             seq = model.apply_memory_positional_encoding(seq)
         mem_tokens.append(seq)  # [S_i, D]
 
@@ -753,6 +754,7 @@ def model_forward_log1p_pred(model: GraphCardinalityEstimatorMultiSubgraph,
     query_norm = getattr(model, "query_norm", nn.Identity())
     tgt = query_norm(tgt)
     if hasattr(model, "cross_interact"):
+        # 复用模型内定义的跨注意力/前馈交互逻辑（若变体关闭该模块则返回原查询 token）
         tgt = model.cross_interact(mem, tgt, memory_key_padding_mask=src_key_padding_mask)
     # 若模型未定义 cross_interact，则沿用原查询 token
 

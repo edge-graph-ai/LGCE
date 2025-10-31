@@ -3,7 +3,7 @@
 from __future__ import annotations
 import numpy as np
 import torch
-from typing import Callable, Dict, List, Sequence, Tuple, Optional
+from typing import Callable, Dict, List, Sequence, Tuple, Optional, Mapping
 from collections import Counter
 from torch.utils.data import WeightedRandomSampler
 
@@ -126,9 +126,11 @@ def build_weighted_loader(
     create_dl_fn: Callable = None,
     num_workers: int = 0,
     pin_memory: bool = False,
+    per_index_multipliers: Optional[Mapping[int, float]] = None,
 ):
     """
     基于 (log1p(y) 分桶 × 稀疏/稠密标签) 的分层加权采样。
+    可选 per_index_multipliers 允许为特定样本额外调整采样权重，聚焦尾部难例。
     不依赖 CONFIG / create_dataloader；需要外部传入 create_dl_fn(dataset, **kwargs)。
 
     返回：由 create_dl_fn 创建的 DataLoader。
@@ -147,8 +149,9 @@ def build_weighted_loader(
             pin_memory=pin_memory,
         )
 
-    y = np.array([dataset.true_cardinalities[i] for i in indices], dtype=np.float64)
-    qids = [dataset.query_ids[i] for i in indices]
+    idx_list = list(indices)
+    y = np.array([dataset.true_cardinalities[i] for i in idx_list], dtype=np.float64)
+    qids = [dataset.query_ids[i] for i in idx_list]
     logy = np.log1p(y)
 
     bin_ids  = _digitize_by_quantiles(logy, strata_num_bins)
@@ -157,17 +160,23 @@ def build_weighted_loader(
     layer_keys = [(int(b), int(d)) for b, d in zip(bin_ids, dens_ids)]
     cnt = Counter(layer_keys)
     weights = np.array([1.0 / cnt[k] for k in layer_keys], dtype=np.float32)
+    if per_index_multipliers:
+        multipliers = np.array(
+            [float(per_index_multipliers.get(int(idx), 1.0)) for idx in idx_list], dtype=np.float32
+        )
+        weights *= multipliers
+    weights = np.clip(weights, a_min=1e-8, a_max=None)
     weights = torch.tensor(weights, dtype=torch.float32)
 
     gen = torch.Generator().manual_seed(int(seed) + 999)
     try:
         sampler = WeightedRandomSampler(
-            weights, num_samples=len(indices), replacement=replacement, generator=gen
+            weights, num_samples=len(idx_list), replacement=replacement, generator=gen
         )
     except TypeError:
         torch.manual_seed(int(seed) + 999)
         sampler = WeightedRandomSampler(
-            weights, num_samples=len(indices), replacement=replacement
+            weights, num_samples=len(idx_list), replacement=replacement
         )
 
     loader = create_dl_fn(
@@ -176,7 +185,7 @@ def build_weighted_loader(
         shuffle=False,
         seed=seed,
         sampler=sampler,
-        indices=indices,
+        indices=idx_list,
         num_workers=num_workers,
         pin_memory=pin_memory,
     )
