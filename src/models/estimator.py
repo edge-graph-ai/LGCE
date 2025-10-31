@@ -276,7 +276,8 @@ class GraphCardinalityEstimatorMultiSubgraph(nn.Module):
     def load_state_dict(self, state_dict, strict: bool = True):  # noqa: D401 - docstring inherited
         # 兼容旧 checkpoint：忽略 TransformerDecoder 的权重
         if not isinstance(state_dict, dict):
-            return super().load_state_dict(state_dict, strict=strict)
+            incompatible = super().load_state_dict(state_dict, strict=strict)
+            return incompatible
         filtered = {k: v for k, v in state_dict.items() if not k.startswith("transformer_decoder.")}
         if strict and len(filtered) != len(state_dict):
             strict = False
@@ -291,8 +292,56 @@ class GraphCardinalityEstimatorMultiSubgraph(nn.Module):
             if not any(any(k.startswith(p) for k in filtered) for p in new_prefixes):
                 strict = False
         incompatible = super().load_state_dict(filtered, strict=strict)
-        if hasattr(incompatible, "missing_keys"):
-            incompatible.missing_keys = [k for k in incompatible.missing_keys if not k.startswith("transformer_decoder.")]
-        if hasattr(incompatible, "unexpected_keys"):
-            incompatible.unexpected_keys = [k for k in incompatible.unexpected_keys if not k.startswith("transformer_decoder.")]
-        return incompatible
+
+        if not hasattr(incompatible, "missing_keys") and not hasattr(incompatible, "unexpected_keys"):
+            return incompatible
+
+        prefix = "transformer_decoder."
+
+        def _filter_keys(keys):
+            if keys is None:
+                return None, False
+            original = list(keys)
+            filtered_keys = [k for k in original if not k.startswith(prefix)]
+            changed = len(filtered_keys) != len(original)
+            return filtered_keys, changed
+
+        missing = getattr(incompatible, "missing_keys", None)
+        unexpected = getattr(incompatible, "unexpected_keys", None)
+
+        filtered_missing, missing_changed = _filter_keys(missing)
+        filtered_unexpected, unexpected_changed = _filter_keys(unexpected)
+
+        if not missing_changed and not unexpected_changed:
+            return incompatible
+
+        if missing_changed and isinstance(missing, list):
+            missing[:] = filtered_missing
+        if unexpected_changed and isinstance(unexpected, list):
+            unexpected[:] = filtered_unexpected
+
+        need_replace = (
+            (missing_changed and not isinstance(missing, list))
+            or (unexpected_changed and not isinstance(unexpected, list))
+        )
+        if not need_replace:
+            return incompatible
+
+        def _value_for_replace(original, filtered, changed):
+            if not changed:
+                return original
+            if original is None:
+                return None
+            if isinstance(original, list):
+                return original
+            try:
+                return type(original)(filtered)
+            except TypeError:
+                return filtered
+
+        new_missing = _value_for_replace(missing, filtered_missing, missing_changed)
+        new_unexpected = _value_for_replace(unexpected, filtered_unexpected, unexpected_changed)
+
+        if hasattr(incompatible, "_replace"):
+            return incompatible._replace(missing_keys=new_missing, unexpected_keys=new_unexpected)
+        return type(incompatible)(new_missing, new_unexpected)
