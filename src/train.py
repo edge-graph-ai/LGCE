@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import argparse
 import os
 
 from src.utils.splits_and_sampling import build_weighted_loader, make_splits_indices_stratified
@@ -16,6 +17,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import amp
 from torch.utils.data import WeightedRandomSampler
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover - optional dependency for CLI config
+    yaml = None
 
 # --------- 解决 "No module named 'src'" ----------
 THIS = os.path.abspath(os.path.dirname(__file__))
@@ -83,6 +89,14 @@ CONFIG = dict(
     USE_MEDIAN_BIAS = True,      # 用 median(log1p(y)) 设 head.bias
     HEAD_LR_MULT    = 10.0,
 
+    ENABLE_EMBED_SHORTCUT = True,
+    EMBED_SHORTCUT_INIT   = 0.0,
+    USE_MULTI_SCALE_POOL  = True,
+    MULTI_SCALE_FUSION    = "gate",
+    MULTI_SCALE_DROPOUT   = None,
+    MULTI_SCALE_GATE_INIT = 0.0,
+    MULTI_SCALE_ATTN_HIDDEN = None,
+
     W_MSLE     = 0.2,   # ↓
     W_QERR     = 0.6,   # ↑ 让相对误差成为主损失
     W_LOGHUBER = 0.2,   # ↑ 让鲁棒的方向性惩罚有存在感
@@ -143,6 +157,66 @@ CONFIG = _bind_output_paths_to_selected_num(_apply_dataset(CONFIG))
 
 GLOBAL_NUM_VERTICES = None
 GLOBAL_NUM_LABELS   = None
+
+
+def _load_yaml_config(path: str) -> dict:
+    if not path:
+        return {}
+    if yaml is None:
+        raise RuntimeError("PyYAML is required to load YAML config files. Please install 'pyyaml' or avoid using --config.")
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"YAML config must be a mapping, got {type(data)!r}")
+    return data
+
+
+def _apply_cli_overrides(args):
+    if args is None:
+        return
+    if getattr(args, "config", None):
+        CONFIG.update(_load_yaml_config(args.config))
+    if getattr(args, "enable_shortcut", None) is not None:
+        CONFIG["ENABLE_EMBED_SHORTCUT"] = bool(args.enable_shortcut)
+    if getattr(args, "shortcut_init", None) is not None:
+        CONFIG["EMBED_SHORTCUT_INIT"] = float(args.shortcut_init)
+    if getattr(args, "enable_multi_scale", None) is not None:
+        CONFIG["USE_MULTI_SCALE_POOL"] = bool(args.enable_multi_scale)
+    if getattr(args, "multi_scale_fusion", None):
+        CONFIG["MULTI_SCALE_FUSION"] = str(args.multi_scale_fusion)
+    if getattr(args, "multi_scale_dropout", None) is not None:
+        CONFIG["MULTI_SCALE_DROPOUT"] = float(args.multi_scale_dropout)
+    if getattr(args, "multi_scale_gate_init", None) is not None:
+        CONFIG["MULTI_SCALE_GATE_INIT"] = float(args.multi_scale_gate_init)
+    if getattr(args, "multi_scale_attn_hidden", None) is not None:
+        CONFIG["MULTI_SCALE_ATTN_HIDDEN"] = int(args.multi_scale_attn_hidden)
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Train Graph Cardinality Estimator")
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML config file to override defaults")
+    parser.add_argument("--enable-shortcut", dest="enable_shortcut", action="store_true",
+                        help="Force enable embed-to-pool shortcut gating")
+    parser.add_argument("--disable-shortcut", dest="enable_shortcut", action="store_false",
+                        help="Disable embed-to-pool shortcut gating")
+    parser.add_argument("--shortcut-init", type=float, default=None,
+                        help="Initial value (pre-sigmoid) for embed shortcut gate")
+    parser.add_argument("--enable-multi-scale", dest="enable_multi_scale", action="store_true",
+                        help="Enable multi-scale pooling wrapper")
+    parser.add_argument("--disable-multi-scale", dest="enable_multi_scale", action="store_false",
+                        help="Disable multi-scale pooling wrapper")
+    parser.add_argument("--multi-scale-fusion", type=str, choices=["gate", "concat"], default=None,
+                        help="Fusion strategy between attention and mean pooling")
+    parser.add_argument("--multi-scale-dropout", type=float, default=None,
+                        help="Dropout applied to the fused multi-scale representation")
+    parser.add_argument("--multi-scale-gate-init", type=float, default=None,
+                        help="Initial value (pre-sigmoid) for multi-scale fusion gate")
+    parser.add_argument("--multi-scale-attn-hidden", type=int, default=None,
+                        help="Hidden size used inside attention pooling when multi-scale is enabled")
+    parser.set_defaults(enable_shortcut=None, enable_multi_scale=None)
+    return parser.parse_args() if len(sys.argv) > 1 else parser.parse_args([])
 
 # ---------------- 工具 ----------------
 def resolve_query_dir(query_root: str, query_num_dir: int | None, query_dir: str | None) -> str:
@@ -473,11 +547,18 @@ def build_model(device, data_graph, num_subgraphs: int):
     cfg = dict(
         gnn_in_ch=8, gnn_hidden_ch=16, gnn_out_ch=32, num_gnn_layers=2,
         transformer_dim=64, transformer_heads=4, transformer_ffn_dim=128,
-        transformer_layers=2,                    
+        transformer_layers=2,
         num_subgraphs=num_subgraphs,
         num_vertices=data_graph.num_vertices,
         num_labels=getattr(data_graph, "num_labels", 64),
         dropout=0.05,
+        enable_embed_shortcut=CONFIG.get("ENABLE_EMBED_SHORTCUT", True),
+        embed_shortcut_init=CONFIG.get("EMBED_SHORTCUT_INIT", 0.0),
+        use_multi_scale_pool=CONFIG.get("USE_MULTI_SCALE_POOL", True),
+        multi_scale_fusion=CONFIG.get("MULTI_SCALE_FUSION", "gate"),
+        multi_scale_dropout=CONFIG.get("MULTI_SCALE_DROPOUT", None),
+        multi_scale_gate_init=CONFIG.get("MULTI_SCALE_GATE_INIT", 0.0),
+        multi_scale_attn_hidden=CONFIG.get("MULTI_SCALE_ATTN_HIDDEN", None),
     )
     model = GraphCardinalityEstimatorMultiSubgraph(**cfg).to(device)
     def _init(m: nn.Module):
@@ -812,7 +893,8 @@ def test(model, loader, device: torch.device, out_path: str = "predictions_and_l
 
 # ---------------- 主流程 ----------------
 def main():
-    global GLOBAL_NUM_VERTICES, GLOBAL_NUM_LABELS
+    global CONFIG, GLOBAL_NUM_VERTICES, GLOBAL_NUM_LABELS
+    CONFIG.update(_bind_output_paths_to_selected_num(_apply_dataset(CONFIG)))
     C = CONFIG
     torch.manual_seed(C["SEED"]); np.random.seed(C["SEED"])
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(C["SEED"])
@@ -1067,4 +1149,6 @@ def main():
     print("\nAll done.")
 
 if __name__ == "__main__":
+    parsed_args = _parse_args()
+    _apply_cli_overrides(parsed_args)
     main()
