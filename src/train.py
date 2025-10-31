@@ -97,6 +97,12 @@ CONFIG = dict(
     MULTI_SCALE_GATE_INIT = 0.0,
     MULTI_SCALE_ATTN_HIDDEN = None,
 
+    ENABLE_CROSS_ATTENTION = True,   # 轻量跨注意力：查询 token 从 memory token 中读信息
+    CROSS_ATTN_HEADS        = 1,
+    CROSS_ATTN_DROPOUT      = None,
+    CROSS_FFN_HIDDEN        = None,
+    USE_MEMORY_POS_ENCODING = True,  # 是否为子图 token 注入顺序位置编码
+
     W_MSLE     = 0.2,   # ↓
     W_QERR     = 0.6,   # ↑ 让相对误差成为主损失
     W_LOGHUBER = 0.2,   # ↑ 让鲁棒的方向性惩罚有存在感
@@ -192,6 +198,16 @@ def _apply_cli_overrides(args):
         CONFIG["MULTI_SCALE_GATE_INIT"] = float(args.multi_scale_gate_init)
     if getattr(args, "multi_scale_attn_hidden", None) is not None:
         CONFIG["MULTI_SCALE_ATTN_HIDDEN"] = int(args.multi_scale_attn_hidden)
+    if getattr(args, "enable_cross_attn", None) is not None:
+        CONFIG["ENABLE_CROSS_ATTENTION"] = bool(args.enable_cross_attn)
+    if getattr(args, "cross_attn_heads", None) is not None:
+        CONFIG["CROSS_ATTN_HEADS"] = int(args.cross_attn_heads)
+    if getattr(args, "cross_attn_dropout", None) is not None:
+        CONFIG["CROSS_ATTN_DROPOUT"] = float(args.cross_attn_dropout)
+    if getattr(args, "cross_ffn_hidden", None) is not None:
+        CONFIG["CROSS_FFN_HIDDEN"] = int(args.cross_ffn_hidden)
+    if getattr(args, "enable_mem_pos", None) is not None:
+        CONFIG["USE_MEMORY_POS_ENCODING"] = bool(args.enable_mem_pos)
 
 
 def _parse_args():
@@ -215,7 +231,26 @@ def _parse_args():
                         help="Initial value (pre-sigmoid) for multi-scale fusion gate")
     parser.add_argument("--multi-scale-attn-hidden", type=int, default=None,
                         help="Hidden size used inside attention pooling when multi-scale is enabled")
-    parser.set_defaults(enable_shortcut=None, enable_multi_scale=None)
+    parser.add_argument("--enable-cross-attn", dest="enable_cross_attn", action="store_true",
+                        help="Enable the lightweight cross-attention head between query and memory tokens")
+    parser.add_argument("--disable-cross-attn", dest="enable_cross_attn", action="store_false",
+                        help="Disable the lightweight cross-attention head")
+    parser.add_argument("--cross-attn-heads", type=int, default=None,
+                        help="Number of heads for the lightweight cross-attention")
+    parser.add_argument("--cross-attn-dropout", type=float, default=None,
+                        help="Dropout applied inside the lightweight cross-attention")
+    parser.add_argument("--cross-ffn-hidden", type=int, default=None,
+                        help="Hidden dim of the feed-forward layer after cross-attention")
+    parser.add_argument("--enable-mem-pos", dest="enable_mem_pos", action="store_true",
+                        help="Inject learnable positional encodings for subgraph memory tokens")
+    parser.add_argument("--disable-mem-pos", dest="enable_mem_pos", action="store_false",
+                        help="Do not add positional encodings to memory tokens")
+    parser.set_defaults(
+        enable_shortcut=None,
+        enable_multi_scale=None,
+        enable_cross_attn=None,
+        enable_mem_pos=None,
+    )
     return parser.parse_args() if len(sys.argv) > 1 else parser.parse_args([])
 
 # ---------------- 工具 ----------------
@@ -559,6 +594,11 @@ def build_model(device, data_graph, num_subgraphs: int):
         multi_scale_dropout=CONFIG.get("MULTI_SCALE_DROPOUT", None),
         multi_scale_gate_init=CONFIG.get("MULTI_SCALE_GATE_INIT", 0.0),
         multi_scale_attn_hidden=CONFIG.get("MULTI_SCALE_ATTN_HIDDEN", None),
+        enable_cross_attention=CONFIG.get("ENABLE_CROSS_ATTENTION", True),
+        cross_attn_heads=CONFIG.get("CROSS_ATTN_HEADS", 1),
+        cross_attn_dropout=CONFIG.get("CROSS_ATTN_DROPOUT", None),
+        cross_ffn_hidden=CONFIG.get("CROSS_FFN_HIDDEN", None),
+        use_memory_positional_encoding=CONFIG.get("USE_MEMORY_POS_ENCODING", True),
     )
     model = GraphCardinalityEstimatorMultiSubgraph(**cfg).to(device)
     def _init(m: nn.Module):
@@ -595,7 +635,10 @@ def model_forward_log1p_pred(model: GraphCardinalityEstimatorMultiSubgraph,
             toks.append(tok)
         if not toks:
             toks = [torch.zeros(1, model.cls_token.shape[-1], device=device, dtype=dtype)]
-        mem_tokens.append(torch.cat(toks, dim=0))  # [S_i, D]
+        seq = torch.cat(toks, dim=0)
+        if hasattr(model, "apply_memory_positional_encoding"):
+            seq = model.apply_memory_positional_encoding(seq)
+        mem_tokens.append(seq)  # [S_i, D]
 
     S_max = max(t.shape[0] for t in mem_tokens)
     D = mem_tokens[0].shape[-1]
@@ -617,15 +660,15 @@ def model_forward_log1p_pred(model: GraphCardinalityEstimatorMultiSubgraph,
     mem = torch.cat([cls_tok, mem_core], dim=1)   # [B,1+S_max,D]
 
     # === key padding mask (True=padding) ===
-    valid_lens = torch.tensor([1 + s for s in valid_S], device=device)  # +1 for cls
+    valid_lens = torch.tensor([1 + s for s in valid_S], device=device, dtype=torch.long)  # +1 for cls
     S_full = mem.size(1)
     ar = torch.arange(S_full, device=device).unsqueeze(0).expand(B, S_full)
     src_key_padding_mask = ar >= valid_lens.unsqueeze(1)   # [B, S_full] bool
 
-    mem_norm = getattr(model, "mem_norm", nn.Identity())
-    mem = mem_norm(mem)
     if hasattr(model, "transformer_encoder"):
         mem = model.transformer_encoder(mem, src_key_padding_mask=src_key_padding_mask)
+    mem_norm = getattr(model, "mem_norm", nn.Identity())
+    mem = mem_norm(mem)
 
     # === query token: [B,1,D] ===
     q_toks = []
@@ -647,10 +690,12 @@ def model_forward_log1p_pred(model: GraphCardinalityEstimatorMultiSubgraph,
     query_norm = getattr(model, "query_norm", nn.Identity())
     tgt = query_norm(tgt)
 
-    if hasattr(model, "transformer_decoder"):
-        tgt = model.transformer_decoder(tgt, mem, memory_key_padding_mask=src_key_padding_mask)  # [B,1,D]
+    if hasattr(model, "cross_interact"):
+        fused = model.cross_interact(mem, tgt, memory_key_padding_mask=src_key_padding_mask)
+    else:
+        fused = tgt
 
-    log1p_pred = model.head(tgt.squeeze(1)).squeeze(-1)  # [B]
+    log1p_pred = model.head(fused.squeeze(1)).squeeze(-1)  # [B]
     return log1p_pred
 
 # ---------------- 校准层 ----------------

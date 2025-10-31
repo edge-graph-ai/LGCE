@@ -11,10 +11,6 @@ class _IdentityEncoder(nn.Module):
     def forward(self, src, *args, **kwargs):
         return src
 
-class _IdentityDecoder(nn.Module):
-    def forward(self, tgt, memory=None, *args, **kwargs):
-        return tgt
-
 # —— 三个消融变体 —— #
 class GraphCE_NoGIN(GraphCardinalityEstimatorMultiSubgraph):
     """取消 GIN：不做消息传递，仅用嵌入+池化"""
@@ -30,10 +26,17 @@ class GraphCE_NoSelfAttn(GraphCardinalityEstimatorMultiSubgraph):
         self.transformer_encoder = _IdentityEncoder()
 
 class GraphCE_NoCrossAttn(GraphCardinalityEstimatorMultiSubgraph):
-    """取消交叉注意力：仅用查询 token 预测"""
+    """取消轻量跨注意力：仅用查询 token 预测"""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.transformer_decoder = _IdentityDecoder()
+        self.enable_cross_attention = False
+        self.cross_attn = None
+        self.cross_ffn = nn.Identity()
+        self.cross_attn_norm = nn.Identity()
+        self.cross_ffn_norm = nn.Identity()
+
+    def cross_interact(self, memory, query, memory_key_padding_mask=None):
+        return query
 
 # —— 工厂 —— #
 def make_model(variant: str, **cfg):

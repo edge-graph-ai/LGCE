@@ -91,10 +91,6 @@ class _IdentityEncoder(nn.Module):
     def forward(self, src, *args, **kwargs):
         return src
 
-class _IdentityDecoder(nn.Module):
-    def forward(self, tgt, memory=None, *args, **kwargs):
-        return tgt
-
 class _MeanPool(nn.Module):
     """简单均值池化：将 [N,D] -> [1,D]"""
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -116,10 +112,17 @@ class GraphCE_NoSelfAttn(GraphCardinalityEstimatorMultiSubgraph):
         self.transformer_encoder = _IdentityEncoder()
 
 class GraphCE_NoCrossAttn(GraphCardinalityEstimatorMultiSubgraph):
-    """取消交叉注意力（TransformerDecoder）"""
+    """取消查询-记忆的轻量跨注意力交互"""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.transformer_decoder = _IdentityDecoder()
+        self.enable_cross_attention = False
+        self.cross_attn = None
+        self.cross_ffn = nn.Identity()
+        self.cross_attn_norm = nn.Identity()
+        self.cross_ffn_norm = nn.Identity()
+
+    def cross_interact(self, memory, query, memory_key_padding_mask=None):
+        return query
 
 class GraphCE_NoAllAttention(GraphCardinalityEstimatorMultiSubgraph):
     """
@@ -137,7 +140,11 @@ class GraphCE_NoAllAttention(GraphCardinalityEstimatorMultiSubgraph):
 
         # 2) 关闭所有 Transformer 注意力
         self.transformer_encoder = _IdentityEncoder()
-        self.transformer_decoder = _IdentityDecoder()
+        self.enable_cross_attention = False
+        self.cross_attn = None
+        self.cross_ffn = nn.Identity()
+        self.cross_attn_norm = nn.Identity()
+        self.cross_ffn_norm = nn.Identity()
 
         # 3) 将 cls/query token 清零并冻结
         with torch.no_grad():
@@ -171,7 +178,14 @@ class GraphCE_NoGINNoAttention(GraphCardinalityEstimatorMultiSubgraph):
         self.pool_query = _MeanPool()
 
         self.transformer_encoder = _IdentityEncoder()
-        self.transformer_decoder = _IdentityDecoder()
+        self.enable_cross_attention = False
+        self.cross_attn = None
+        self.cross_ffn = nn.Identity()
+        self.cross_attn_norm = nn.Identity()
+        self.cross_ffn_norm = nn.Identity()
+
+    def cross_interact(self, memory, query, memory_key_padding_mask=None):
+        return query
 
         with torch.no_grad():
             if isinstance(self.cls_token, torch.Tensor):
@@ -246,6 +260,12 @@ CONFIG = dict(
     MULTI_SCALE_DROPOUT   = None,
     MULTI_SCALE_GATE_INIT = 0.0,
     MULTI_SCALE_ATTN_HIDDEN = None,
+
+    ENABLE_CROSS_ATTENTION = True,  # 查询 token 是否通过轻量跨注意力读取 memory token
+    CROSS_ATTN_HEADS        = 1,
+    CROSS_ATTN_DROPOUT      = None,
+    CROSS_FFN_HIDDEN        = None,
+    USE_MEMORY_POS_ENCODING = True,  # 是否注入可学习的子图顺序编码
 
     # —— 三损失权重（可按需调整）——
     LAMBDA_MSLE        = 0.2,
@@ -346,6 +366,16 @@ def _apply_cli_overrides(args):
         CONFIG["MULTI_SCALE_GATE_INIT"] = float(args.multi_scale_gate_init)
     if getattr(args, "multi_scale_attn_hidden", None) is not None:
         CONFIG["MULTI_SCALE_ATTN_HIDDEN"] = int(args.multi_scale_attn_hidden)
+    if getattr(args, "enable_cross_attn", None) is not None:
+        CONFIG["ENABLE_CROSS_ATTENTION"] = bool(args.enable_cross_attn)
+    if getattr(args, "cross_attn_heads", None) is not None:
+        CONFIG["CROSS_ATTN_HEADS"] = int(args.cross_attn_heads)
+    if getattr(args, "cross_attn_dropout", None) is not None:
+        CONFIG["CROSS_ATTN_DROPOUT"] = float(args.cross_attn_dropout)
+    if getattr(args, "cross_ffn_hidden", None) is not None:
+        CONFIG["CROSS_FFN_HIDDEN"] = int(args.cross_ffn_hidden)
+    if getattr(args, "enable_mem_pos", None) is not None:
+        CONFIG["USE_MEMORY_POS_ENCODING"] = bool(args.enable_mem_pos)
 
 # ---------------- 工具 ----------------
 def resolve_query_dir(query_root: str, query_num_dir: int | None, query_dir: str | None) -> str:
@@ -619,6 +649,11 @@ def build_model(device, data_graph, num_subgraphs: int):
         multi_scale_dropout=CONFIG.get("MULTI_SCALE_DROPOUT", None),
         multi_scale_gate_init=CONFIG.get("MULTI_SCALE_GATE_INIT", 0.0),
         multi_scale_attn_hidden=CONFIG.get("MULTI_SCALE_ATTN_HIDDEN", None),
+        enable_cross_attention=CONFIG.get("ENABLE_CROSS_ATTENTION", True),
+        cross_attn_heads=CONFIG.get("CROSS_ATTN_HEADS", 1),
+        cross_attn_dropout=CONFIG.get("CROSS_ATTN_DROPOUT", None),
+        cross_ffn_hidden=CONFIG.get("CROSS_FFN_HIDDEN", None),
+        use_memory_positional_encoding=CONFIG.get("USE_MEMORY_POS_ENCODING", True),
     )
     variant = CONFIG.get("MODEL_VARIANT", "BASE")
     model = make_ablation_model(variant, **cfg).to(device)
@@ -656,29 +691,39 @@ def model_forward_log1p_pred(model: GraphCardinalityEstimatorMultiSubgraph,
             toks.append(tok)
         if not toks:
             toks = [torch.zeros(1, model.cls_token.shape[-1], device=device, dtype=dtype)]
-        mem_tokens.append(torch.cat(toks, dim=0))  # [S_i, D]
+        seq = torch.cat(toks, dim=0)
+        if hasattr(model, "apply_memory_positional_encoding"):
+            seq = model.apply_memory_positional_encoding(seq)
+        mem_tokens.append(seq)  # [S_i, D]
 
     S_max = max(t.shape[0] for t in mem_tokens)
     D = mem_tokens[0].shape[-1]
     padded = []
+    valid_S = []
     for t in mem_tokens:
+        valid_S.append(t.shape[0])
         if t.shape[0] < S_max:
             pad_rows = torch.zeros(S_max - t.shape[0], D, device=device, dtype=dtype)
-            t = torch.concat([t, pad_rows], dim=0)
+            t = torch.cat([t, pad_rows], dim=0)
         padded.append(t)
-    mem = torch.stack(padded, dim=0)  # [B,S_max,D]
-    B = mem.shape[0]
+    mem_core = torch.stack(padded, dim=0)  # [B,S_max,D]
+    B = mem_core.shape[0]
 
     if hasattr(model, "cls_token") and isinstance(model.cls_token, torch.Tensor):
         cls_tok = model.cls_token.to(device=device, dtype=dtype).expand(B, 1, D)
     else:
         cls_tok = torch.zeros(B, 1, D, device=device, dtype=dtype)
-    mem = torch.cat([cls_tok, mem], dim=1)  # [B,1+S,D]
+    mem = torch.cat([cls_tok, mem_core], dim=1)  # [B,1+S,D]
 
+    valid_lens = torch.tensor([1 + s for s in valid_S], device=device, dtype=torch.long)
+    S_full = mem.size(1)
+    ar = torch.arange(S_full, device=device).unsqueeze(0).expand(B, S_full)
+    src_key_padding_mask = ar >= valid_lens.unsqueeze(1)
+
+    if hasattr(model, "transformer_encoder"):
+        mem = model.transformer_encoder(mem, src_key_padding_mask=src_key_padding_mask)
     mem_norm = getattr(model, "mem_norm", nn.Identity())
     mem = mem_norm(mem)
-    if hasattr(model, "transformer_encoder"):
-        mem = model.transformer_encoder(mem)
 
     # === query token: [B,1,D] ===
     q_toks = []
@@ -707,8 +752,9 @@ def model_forward_log1p_pred(model: GraphCardinalityEstimatorMultiSubgraph,
 
     query_norm = getattr(model, "query_norm", nn.Identity())
     tgt = query_norm(tgt)
-    if hasattr(model, "transformer_decoder"):
-        tgt = model.transformer_decoder(tgt, mem)  # [B,1,D]
+    if hasattr(model, "cross_interact"):
+        tgt = model.cross_interact(mem, tgt, memory_key_padding_mask=src_key_padding_mask)
+    # 若模型未定义 cross_interact，则沿用原查询 token
 
     # ===== 关键：检查 tgt 是否已异常 =====
     if check_invalid_data(tgt):
@@ -1110,11 +1156,30 @@ def main():
                         help="Initial logit for multi-scale fusion gate")
     parser.add_argument("--multi-scale-attn-hidden", type=int, default=None,
                         help="Hidden size for attention pooling within multi-scale module")
+    parser.add_argument("--enable-cross-attn", dest="enable_cross_attn", action="store_true",
+                        help="Enable the lightweight cross-attention head between query and memory tokens")
+    parser.add_argument("--disable-cross-attn", dest="enable_cross_attn", action="store_false",
+                        help="Disable the lightweight cross-attention head")
+    parser.add_argument("--cross-attn-heads", type=int, default=None,
+                        help="Number of heads used by the lightweight cross-attention")
+    parser.add_argument("--cross-attn-dropout", type=float, default=None,
+                        help="Dropout applied inside the lightweight cross-attention")
+    parser.add_argument("--cross-ffn-hidden", type=int, default=None,
+                        help="Hidden size of the feed-forward fusion layer after cross-attention")
+    parser.add_argument("--enable-mem-pos", dest="enable_mem_pos", action="store_true",
+                        help="Inject learnable positional encodings into memory tokens")
+    parser.add_argument("--disable-mem-pos", dest="enable_mem_pos", action="store_false",
+                        help="Disable positional encodings for memory tokens")
     parser.add_argument(
         "--variant", type=str, default=None,
         help="选择消融：BASE | NO_GIN | NO_ATTENTION | NO_GIN_NO_ATTENTION （兼容：NO_ENCODER | NO_DECODER）"
     )
-    parser.set_defaults(enable_shortcut=None, enable_multi_scale=None)
+    parser.set_defaults(
+        enable_shortcut=None,
+        enable_multi_scale=None,
+        enable_cross_attn=None,
+        enable_mem_pos=None,
+    )
     args = parser.parse_args()
     _apply_cli_overrides(args)
     if args.variant:
