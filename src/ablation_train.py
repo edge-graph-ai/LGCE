@@ -251,7 +251,7 @@ CONFIG = dict(
 
     USE_MEDIAN_BIAS = True,
     HEAD_LR_MULT    = 10.0,
-    QERR_CLIP_MAX   = 1e4,
+    QERR_CLIP_MAX   = 1e5,
 
     ENABLE_EMBED_SHORTCUT = True,
     EMBED_SHORTCUT_INIT   = 0.0,
@@ -275,6 +275,10 @@ CONFIG = dict(
     # robust signed log10(qerr) 的配置
     LOG_HUBER_DELTA = 0.25,
     TRIM_RATIO      = 0.05,
+
+    TAIL_QERR_LOG10_THRESH   = 4.0,  # 约等于 QErr >= 1e4 时触发额外惩罚
+    TAIL_QERR_PENALTY_WEIGHT = 0.3,
+    TAIL_QERR_PENALTY_POWER  = 2.0,
 
     STRATA_NUM_BINS = 5,
     USE_WEIGHTED_SAMPLER = True,
@@ -693,6 +697,7 @@ def model_forward_log1p_pred(model: GraphCardinalityEstimatorMultiSubgraph,
             toks = [torch.zeros(1, model.cls_token.shape[-1], device=device, dtype=dtype)]
         seq = torch.cat(toks, dim=0)
         if hasattr(model, "apply_memory_positional_encoding"):
+            # 与主训练脚本保持一致：让记忆 token 叠加位置编码后再进入 encoder
             seq = model.apply_memory_positional_encoding(seq)
         mem_tokens.append(seq)  # [S_i, D]
 
@@ -753,6 +758,7 @@ def model_forward_log1p_pred(model: GraphCardinalityEstimatorMultiSubgraph,
     query_norm = getattr(model, "query_norm", nn.Identity())
     tgt = query_norm(tgt)
     if hasattr(model, "cross_interact"):
+        # 复用模型内定义的跨注意力/前馈交互逻辑（若变体关闭该模块则返回原查询 token）
         tgt = model.cross_interact(mem, tgt, memory_key_padding_mask=src_key_padding_mask)
     # 若模型未定义 cross_interact，则沿用原查询 token
 
@@ -1012,7 +1018,19 @@ def train_one_phase(model, train_loader, val_loader, optimizer, scheduler,
                           + CONFIG["LAMBDA_QERR_MEAN"]   * loss_qerr
                           + CONFIG["LAMBDA_SIGNED_LOGQ"] * loss_signed)
 
-                    # calibrator 正则（若仍在学习） 
+                    tail_weight = float(CONFIG.get("TAIL_QERR_PENALTY_WEIGHT", 0.0))
+                    tail_penalty = torch.zeros((), device=log1p_pred.device, dtype=log1p_pred.dtype)
+                    if tail_weight > 0:
+                        log10_q = torch.log10(qerr.clamp_min(1.0))
+                        thresh = float(CONFIG.get("TAIL_QERR_LOG10_THRESH", 1.0))
+                        excess = torch.clamp(log10_q - thresh, min=0.0)
+                        power = float(CONFIG.get("TAIL_QERR_PENALTY_POWER", 1.0))
+                        if power != 1.0:
+                            excess = excess.pow(power)
+                        tail_penalty = excess.mean()
+                        loss = loss + tail_weight * tail_penalty
+
+                    # calibrator 正则（若仍在学习）
                     if calibrator is not None and any(p.requires_grad for p in calibrator.parameters()):
                         loss = loss + CONFIG.get("CALIB_REG", 0.0) * (
                             (calibrator.a - 1.0) ** 2 + (calibrator.b - 0.0) ** 2
@@ -1039,10 +1057,15 @@ def train_one_phase(model, train_loader, val_loader, optimizer, scheduler,
                             ema_state[k].mul_(ema_decay).add_(v_det, alpha=1.0 - ema_decay)
 
                 running += float(loss.item())
-                bar.set_postfix(loss=f"{running/(bar.n+1):.4f}",
-                                msle=f"{loss_msle.item():.3f}",
-                                qerr=f"{loss_qerr.item():.3f}",
-                                slogq=f"{loss_signed.item():.3f}")
+                postfix = dict(
+                    loss=f"{running/(bar.n+1):.4f}",
+                    msle=f"{loss_msle.item():.3f}",
+                    qerr=f"{loss_qerr.item():.3f}",
+                    slogq=f"{loss_signed.item():.3f}",
+                )
+                if tail_weight > 0:
+                    postfix["tail"] = f"{tail_penalty.item():.3f}"
+                bar.set_postfix(**postfix)
 
         print(f"Epoch {epoch}/{epochs}  TrainLoss={running/max(1,len(train_loader)):.6f}  time={time.perf_counter()-start:.1f}s")
 

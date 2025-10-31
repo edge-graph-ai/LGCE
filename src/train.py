@@ -109,13 +109,22 @@ CONFIG = dict(
     LOG_HUBER_DELTA = 0.25,   # 稍小一些，更像L1，拉开分布
     TRIM_RATIO     = 0.05 ,   # 少量修剪，留出“拉开的”梯度
 
+    TAIL_QERR_LOG10_THRESH  = 4.0,   # 约等于 QErr >= 1e4 时触发额外惩罚
+    TAIL_QERR_PENALTY_WEIGHT = 0.3,
+    TAIL_QERR_PENALTY_POWER  = 2.0,
+
     # 训练中 QErr 的裁剪上界，避免梯度爆炸；测试阶段不裁剪
-    QERR_CLIP_MAX   = 1e4,
+    QERR_CLIP_MAX   = 1e5,
 
 
     STRATA_NUM_BINS = 5,
     USE_WEIGHTED_SAMPLER = True,
     SAMPLE_REPLACEMENT  = True,
+
+    ENABLE_TAIL_SAMPLE_REWEIGHT   = True,
+    TAIL_SAMPLE_REWEIGHT_PCT      = 0.15,   # 针对 top-15% 高 QErr 样本调高权重
+    TAIL_SAMPLE_REWEIGHT_FACTOR   = 3.0,
+    TAIL_SAMPLE_REWEIGHT_MIN_QERR = 5.0,
 
     USE_CALIBRATOR      = False,
     CALIB_LR_MULT       = 15.0,
@@ -569,9 +578,23 @@ def composite_loss(log1p_pred: torch.Tensor, y: torch.Tensor) -> tuple[torch.Ten
     huber_logq = _trimmed_mean_loss(huber_raw, CONFIG["TRIM_RATIO"])
 
     total = CONFIG["W_MSLE"] * msle + CONFIG["W_QERR"] * mean_qerr + CONFIG["W_LOGHUBER"] * huber_logq
+
+    tail_penalty = torch.zeros(1, device=log1p_pred.device, dtype=log1p_pred.dtype)
+    tail_weight = float(CONFIG.get("TAIL_QERR_PENALTY_WEIGHT", 0.0))
+    if tail_weight > 0:
+        log10_q = torch.log10(qerr.clamp_min(1.0))
+        thresh = float(CONFIG.get("TAIL_QERR_LOG10_THRESH", 1.0))
+        excess = F.relu(log10_q - thresh)
+        power = float(CONFIG.get("TAIL_QERR_PENALTY_POWER", 1.0))
+        if power != 1.0:
+            excess = excess.pow(power)
+        tail_penalty = excess.mean()
+        total = total + tail_weight * tail_penalty
+
     parts = dict(msle=float(msle.item()),
                  mean_qerr=float(mean_qerr.item()),
                  huber_logq=float(huber_logq.item()),
+                 tail_penalty=float(tail_penalty.item()) if tail_weight > 0 else 0.0,
                  total=float(total.item()))
     return total, parts
 
@@ -814,12 +837,15 @@ def train_one_phase(model, train_loader, val_loader, optimizer, scheduler,
                 # ------------------------------------------------
 
                 running += float(loss.item())
-                bar.set_postfix(
+                postfix = dict(
                     loss=f"{running/(bar.n+1):.4f}",
                     msle=f"{parts['msle']:.3f}",
                     qerr=f"{parts['mean_qerr']:.3f}",
                     huber=f"{parts['huber_logq']:.3f}"
                 )
+                if CONFIG.get("TAIL_QERR_PENALTY_WEIGHT", 0.0) > 0:
+                    postfix["tail"] = f"{parts.get('tail_penalty', 0.0):.3f}"
+                bar.set_postfix(**postfix)
 
         print(f"Epoch {epoch}/{epochs}  TrainLoss={running/max(1,len(train_loader)):.6f}  time={time.perf_counter()-start:.1f}s")
 
@@ -935,6 +961,59 @@ def test(model, loader, device: torch.device, out_path: str = "predictions_and_l
         f.write(f"# total_test_time_sec: {total_time:.6f}\n")
         f.write(f"# average_query_time_sec: {avg_query_time:.6f}\n")
     return avg_q, med, q3, iqr_abs
+
+# ---------------- 高 QErr 样本识别 ----------------
+def collect_qerror_for_indices(
+    model: GraphCardinalityEstimatorMultiSubgraph,
+    dataset,
+    indices: list[int],
+    device: torch.device,
+    *,
+    calibrator: OutputCalibrator | None = None,
+    batch_size: int = 32,
+):
+    """返回 {dataset_idx: qerr}，用于后续加权采样。"""
+    if not indices:
+        return {}
+
+    loader = create_dataloader(
+        dataset,
+        batch_size,
+        indices=indices,
+        shuffle=False,
+        seed=0,
+        pin_memory=False,
+    )
+
+    prev_training = model.training
+    model.eval()
+    prev_calib_training = None
+    if calibrator is not None:
+        prev_calib_training = calibrator.training
+        calibrator.eval()
+
+    stats = {}
+    offset = 0
+    with torch.no_grad():
+        for data_graph_batch, query_batch, y in loader:
+            cur_idx = indices[offset: offset + int(y.numel())]
+            offset += int(y.numel())
+            data_graph_batch, query_batch, y = move_batch_to_device(
+                data_graph_batch, query_batch, y, device
+            )
+            log1p_pred = model_forward_log1p_pred(model, data_graph_batch, query_batch)
+            if calibrator is not None:
+                log1p_pred = calibrator(log1p_pred)
+            qerr, _, _ = _qerror_tensor_from_log1p(log1p_pred, y, cap=None)
+            for idx, qe in zip(cur_idx, qerr.detach().cpu().tolist()):
+                stats[int(idx)] = float(qe)
+
+    if prev_training:
+        model.train()
+    if calibrator is not None and prev_calib_training:
+        calibrator.train()
+
+    return stats
 
 # ---------------- 主流程 ----------------
 def main():
@@ -1121,16 +1200,6 @@ def main():
         inner_train_idx = tr_shuf[cut:]
         print(f"[Fold {i}] inner-train={len(inner_train_idx)}  inner-val={len(inner_val_idx)}")
 
-        # 训练加载器：仅 inner-train
-        if CONFIG["USE_WEIGHTED_SAMPLER"]:
-            ft_train_dl = build_weighted_loader(
-                dataset, inner_train_idx, batch_size=CONFIG["BATCH_SIZE"], create_dl_fn=create_dataloader, 
-                seed=C["SEED"], num_workers=CONFIG["NUM_WORKERS"], pin_memory=False
-            )
-        else:
-            ft_train_dl = create_dataloader(dataset, CONFIG["BATCH_SIZE"], indices=inner_train_idx,
-                                            shuffle=True, seed=C["SEED"], pin_memory=False)
-
         # 早停验证加载器：inner-val
         ft_inner_val_dl = create_dataloader(dataset, CONFIG["BATCH_SIZE"], indices=inner_val_idx,
                                             shuffle=False, seed=C["SEED"], pin_memory=False)
@@ -1155,6 +1224,66 @@ def main():
             model_k.load_state_dict(model_keys, strict=False)
             if calibrator_k is not None and calib_keys:
                 calibrator_k.load_state_dict(calib_keys, strict=False)
+
+        tail_multipliers = None
+        if (
+            CONFIG.get("ENABLE_TAIL_SAMPLE_REWEIGHT", True)
+            and CONFIG.get("USE_WEIGHTED_SAMPLER", True)
+            and inner_train_idx
+        ):
+            tail_pct = float(CONFIG.get("TAIL_SAMPLE_REWEIGHT_PCT", 0.0))
+            tail_factor = float(CONFIG.get("TAIL_SAMPLE_REWEIGHT_FACTOR", 1.0))
+            tail_min_qerr = float(CONFIG.get("TAIL_SAMPLE_REWEIGHT_MIN_QERR", 1.0))
+            if tail_pct > 0 and tail_factor > 1.0:
+                if tail_pct > 1.0:
+                    tail_pct = tail_pct / 100.0
+                print(f"[Fold {i}] 收集预估 Q-Error 以识别尾部样本 …")
+                qerr_map = collect_qerror_for_indices(
+                    model_k,
+                    dataset,
+                    inner_train_idx,
+                    device,
+                    calibrator=calibrator_k,
+                    batch_size=CONFIG["BATCH_SIZE"],
+                )
+                if qerr_map:
+                    qerr_vals = np.array([qerr_map[idx] for idx in inner_train_idx], dtype=np.float64)
+                    perc = max(0.0, min(100.0, 100.0 * (1.0 - tail_pct)))
+                    tail_threshold = float(np.percentile(qerr_vals, perc))
+                    cutoff = max(tail_min_qerr, tail_threshold)
+                    tail_indices = [idx for idx in inner_train_idx if qerr_map[idx] >= cutoff]
+                    if tail_indices:
+                        tail_multipliers = {idx: tail_factor for idx in tail_indices}
+                        print(
+                            f"[Fold {i}] Tail boost: {len(tail_indices)}/{len(inner_train_idx)} samples "
+                            f">= {cutoff:.3f} (factor={tail_factor})"
+                        )
+                    else:
+                        print(f"[Fold {i}] 未找到满足 cutoff={cutoff:.3f} 的高 Q-Error 样本。")
+
+        # 训练加载器：仅 inner-train（带高 QErr 重加权）
+        if CONFIG["USE_WEIGHTED_SAMPLER"]:
+            ft_train_dl = build_weighted_loader(
+                dataset,
+                inner_train_idx,
+                batch_size=CONFIG["BATCH_SIZE"],
+                create_dl_fn=create_dataloader,
+                seed=C["SEED"],
+                num_workers=CONFIG["NUM_WORKERS"],
+                pin_memory=False,
+                per_index_multipliers=tail_multipliers,
+            )
+        else:
+            if tail_multipliers:
+                print("[Warn] Tail reweighting需要 USE_WEIGHTED_SAMPLER=True；当前将忽略。")
+            ft_train_dl = create_dataloader(
+                dataset,
+                CONFIG["BATCH_SIZE"],
+                indices=inner_train_idx,
+                shuffle=True,
+                seed=C["SEED"],
+                pin_memory=False,
+            )
 
         y_fold_train = np.array([prepared['true_cardinalities'][j] for j in inner_train_idx], dtype=np.float64)
         # mu_fold = float((np.median if CONFIG["USE_MEDIAN_BIAS"] else np.mean)(np.log1p(y_fold_train))) if y_fold_train.size else 0.0
