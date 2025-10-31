@@ -47,3 +47,69 @@ class TokenAttentionPool(nn.Module):
             return torch.sum(w.unsqueeze(-1) * x, dim=1)                    # [B, D]
         else:
             raise ValueError(f"TokenAttentionPool expects [N,D] or [B,N,D], got {x.shape}")
+
+
+class MultiScaleTokenPool(nn.Module):
+    """Combine TokenAttentionPool with a secondary pooling branch (mean-pool).
+
+    When ``enabled`` is True, the module fuses the attention pooled feature with a
+    global average pooled feature either via a sigmoid-gated weighted sum or a
+    learnable linear projection on the concatenation of both features.  When it is
+    disabled, it behaves exactly like :class:`TokenAttentionPool`.
+    """
+
+    def __init__(self,
+                 hidden_dim: int,
+                 attn_hidden: int = 64,
+                 dropout: float = 0.1,
+                 *,
+                 enabled: bool = True,
+                 fusion: str = "gate",
+                 gate_init: float = 0.0,
+                 fusion_dropout: float = 0.0) -> None:
+        super().__init__()
+        self.attn_pool = TokenAttentionPool(hidden_dim, attn_hidden=attn_hidden, dropout=dropout)
+        self.enabled = bool(enabled)
+        self.fusion = (fusion or "gate").lower()
+        if self.enabled:
+            if self.fusion in {"gate", "gated", "sigmoid", "weighted"}:
+                self._gate = nn.Parameter(torch.tensor(float(gate_init)))
+                self._gate_act = nn.Sigmoid()
+                self._fuse = None
+            elif self.fusion in {"concat", "linear"}:
+                self._gate = None
+                self._gate_act = None
+                self._fuse = nn.Linear(hidden_dim * 2, hidden_dim)
+                nn.init.xavier_uniform_(self._fuse.weight)
+                nn.init.zeros_(self._fuse.bias)
+            else:
+                raise ValueError(f"Unsupported fusion mode: {fusion}")
+        else:
+            self._gate = None
+            self._gate_act = None
+            self._fuse = None
+        self._drop = nn.Dropout(fusion_dropout) if (fusion_dropout and fusion_dropout > 0) else nn.Identity()
+
+    @staticmethod
+    def _mean_pool(x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:
+            return x.mean(dim=0, keepdim=True)
+        if x.dim() == 3:
+            return x.mean(dim=1)
+        raise ValueError(f"MultiScaleTokenPool expects [N,D] or [B,N,D], got {x.shape}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        attn = self.attn_pool(x)
+        if not self.enabled or x.numel() == 0:
+            return attn
+
+        mean = self._mean_pool(x)
+        if self._gate is not None:
+            gate = self._gate_act(self._gate)
+            fused = gate * attn + (1.0 - gate) * mean
+            return self._drop(fused)
+        if self._fuse is not None:
+            fused = torch.cat([attn, mean], dim=-1)
+            fused = self._drop(fused)
+            return self._fuse(fused)
+        return attn

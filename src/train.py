@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import argparse
 import os
 
 from src.utils.splits_and_sampling import build_weighted_loader, make_splits_indices_stratified
@@ -16,6 +17,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import amp
 from torch.utils.data import WeightedRandomSampler
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover - optional dependency for CLI config
+    yaml = None
 
 # --------- 解决 "No module named 'src'" ----------
 THIS = os.path.abspath(os.path.dirname(__file__))
@@ -83,6 +89,20 @@ CONFIG = dict(
     USE_MEDIAN_BIAS = True,      # 用 median(log1p(y)) 设 head.bias
     HEAD_LR_MULT    = 10.0,
 
+    ENABLE_EMBED_SHORTCUT = True,
+    EMBED_SHORTCUT_INIT   = 0.0,
+    USE_MULTI_SCALE_POOL  = True,
+    MULTI_SCALE_FUSION    = "gate",
+    MULTI_SCALE_DROPOUT   = None,
+    MULTI_SCALE_GATE_INIT = 0.0,
+    MULTI_SCALE_ATTN_HIDDEN = None,
+
+    ENABLE_CROSS_ATTENTION = True,   # 轻量跨注意力：查询 token 从 memory token 中读信息
+    CROSS_ATTN_HEADS        = 1,
+    CROSS_ATTN_DROPOUT      = None,
+    CROSS_FFN_HIDDEN        = None,
+    USE_MEMORY_POS_ENCODING = True,  # 是否为子图 token 注入顺序位置编码
+
     W_MSLE     = 0.2,   # ↓
     W_QERR     = 0.6,   # ↑ 让相对误差成为主损失
     W_LOGHUBER = 0.2,   # ↑ 让鲁棒的方向性惩罚有存在感
@@ -143,6 +163,95 @@ CONFIG = _bind_output_paths_to_selected_num(_apply_dataset(CONFIG))
 
 GLOBAL_NUM_VERTICES = None
 GLOBAL_NUM_LABELS   = None
+
+
+def _load_yaml_config(path: str) -> dict:
+    if not path:
+        return {}
+    if yaml is None:
+        raise RuntimeError("PyYAML is required to load YAML config files. Please install 'pyyaml' or avoid using --config.")
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"YAML config must be a mapping, got {type(data)!r}")
+    return data
+
+
+def _apply_cli_overrides(args):
+    if args is None:
+        return
+    if getattr(args, "config", None):
+        CONFIG.update(_load_yaml_config(args.config))
+    if getattr(args, "enable_shortcut", None) is not None:
+        CONFIG["ENABLE_EMBED_SHORTCUT"] = bool(args.enable_shortcut)
+    if getattr(args, "shortcut_init", None) is not None:
+        CONFIG["EMBED_SHORTCUT_INIT"] = float(args.shortcut_init)
+    if getattr(args, "enable_multi_scale", None) is not None:
+        CONFIG["USE_MULTI_SCALE_POOL"] = bool(args.enable_multi_scale)
+    if getattr(args, "multi_scale_fusion", None):
+        CONFIG["MULTI_SCALE_FUSION"] = str(args.multi_scale_fusion)
+    if getattr(args, "multi_scale_dropout", None) is not None:
+        CONFIG["MULTI_SCALE_DROPOUT"] = float(args.multi_scale_dropout)
+    if getattr(args, "multi_scale_gate_init", None) is not None:
+        CONFIG["MULTI_SCALE_GATE_INIT"] = float(args.multi_scale_gate_init)
+    if getattr(args, "multi_scale_attn_hidden", None) is not None:
+        CONFIG["MULTI_SCALE_ATTN_HIDDEN"] = int(args.multi_scale_attn_hidden)
+    if getattr(args, "enable_cross_attn", None) is not None:
+        CONFIG["ENABLE_CROSS_ATTENTION"] = bool(args.enable_cross_attn)
+    if getattr(args, "cross_attn_heads", None) is not None:
+        CONFIG["CROSS_ATTN_HEADS"] = int(args.cross_attn_heads)
+    if getattr(args, "cross_attn_dropout", None) is not None:
+        CONFIG["CROSS_ATTN_DROPOUT"] = float(args.cross_attn_dropout)
+    if getattr(args, "cross_ffn_hidden", None) is not None:
+        CONFIG["CROSS_FFN_HIDDEN"] = int(args.cross_ffn_hidden)
+    if getattr(args, "enable_mem_pos", None) is not None:
+        CONFIG["USE_MEMORY_POS_ENCODING"] = bool(args.enable_mem_pos)
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Train Graph Cardinality Estimator")
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML config file to override defaults")
+    parser.add_argument("--enable-shortcut", dest="enable_shortcut", action="store_true",
+                        help="Force enable embed-to-pool shortcut gating")
+    parser.add_argument("--disable-shortcut", dest="enable_shortcut", action="store_false",
+                        help="Disable embed-to-pool shortcut gating")
+    parser.add_argument("--shortcut-init", type=float, default=None,
+                        help="Initial value (pre-sigmoid) for embed shortcut gate")
+    parser.add_argument("--enable-multi-scale", dest="enable_multi_scale", action="store_true",
+                        help="Enable multi-scale pooling wrapper")
+    parser.add_argument("--disable-multi-scale", dest="enable_multi_scale", action="store_false",
+                        help="Disable multi-scale pooling wrapper")
+    parser.add_argument("--multi-scale-fusion", type=str, choices=["gate", "concat"], default=None,
+                        help="Fusion strategy between attention and mean pooling")
+    parser.add_argument("--multi-scale-dropout", type=float, default=None,
+                        help="Dropout applied to the fused multi-scale representation")
+    parser.add_argument("--multi-scale-gate-init", type=float, default=None,
+                        help="Initial value (pre-sigmoid) for multi-scale fusion gate")
+    parser.add_argument("--multi-scale-attn-hidden", type=int, default=None,
+                        help="Hidden size used inside attention pooling when multi-scale is enabled")
+    parser.add_argument("--enable-cross-attn", dest="enable_cross_attn", action="store_true",
+                        help="Enable the lightweight cross-attention head between query and memory tokens")
+    parser.add_argument("--disable-cross-attn", dest="enable_cross_attn", action="store_false",
+                        help="Disable the lightweight cross-attention head")
+    parser.add_argument("--cross-attn-heads", type=int, default=None,
+                        help="Number of heads for the lightweight cross-attention")
+    parser.add_argument("--cross-attn-dropout", type=float, default=None,
+                        help="Dropout applied inside the lightweight cross-attention")
+    parser.add_argument("--cross-ffn-hidden", type=int, default=None,
+                        help="Hidden dim of the feed-forward layer after cross-attention")
+    parser.add_argument("--enable-mem-pos", dest="enable_mem_pos", action="store_true",
+                        help="Inject learnable positional encodings for subgraph memory tokens")
+    parser.add_argument("--disable-mem-pos", dest="enable_mem_pos", action="store_false",
+                        help="Do not add positional encodings to memory tokens")
+    parser.set_defaults(
+        enable_shortcut=None,
+        enable_multi_scale=None,
+        enable_cross_attn=None,
+        enable_mem_pos=None,
+    )
+    return parser.parse_args() if len(sys.argv) > 1 else parser.parse_args([])
 
 # ---------------- 工具 ----------------
 def resolve_query_dir(query_root: str, query_num_dir: int | None, query_dir: str | None) -> str:
@@ -473,11 +582,23 @@ def build_model(device, data_graph, num_subgraphs: int):
     cfg = dict(
         gnn_in_ch=8, gnn_hidden_ch=16, gnn_out_ch=32, num_gnn_layers=2,
         transformer_dim=64, transformer_heads=4, transformer_ffn_dim=128,
-        transformer_layers=2,                    
+        transformer_layers=2,
         num_subgraphs=num_subgraphs,
         num_vertices=data_graph.num_vertices,
         num_labels=getattr(data_graph, "num_labels", 64),
         dropout=0.05,
+        enable_embed_shortcut=CONFIG.get("ENABLE_EMBED_SHORTCUT", True),
+        embed_shortcut_init=CONFIG.get("EMBED_SHORTCUT_INIT", 0.0),
+        use_multi_scale_pool=CONFIG.get("USE_MULTI_SCALE_POOL", True),
+        multi_scale_fusion=CONFIG.get("MULTI_SCALE_FUSION", "gate"),
+        multi_scale_dropout=CONFIG.get("MULTI_SCALE_DROPOUT", None),
+        multi_scale_gate_init=CONFIG.get("MULTI_SCALE_GATE_INIT", 0.0),
+        multi_scale_attn_hidden=CONFIG.get("MULTI_SCALE_ATTN_HIDDEN", None),
+        enable_cross_attention=CONFIG.get("ENABLE_CROSS_ATTENTION", True),
+        cross_attn_heads=CONFIG.get("CROSS_ATTN_HEADS", 1),
+        cross_attn_dropout=CONFIG.get("CROSS_ATTN_DROPOUT", None),
+        cross_ffn_hidden=CONFIG.get("CROSS_FFN_HIDDEN", None),
+        use_memory_positional_encoding=CONFIG.get("USE_MEMORY_POS_ENCODING", True),
     )
     model = GraphCardinalityEstimatorMultiSubgraph(**cfg).to(device)
     def _init(m: nn.Module):
@@ -514,7 +635,10 @@ def model_forward_log1p_pred(model: GraphCardinalityEstimatorMultiSubgraph,
             toks.append(tok)
         if not toks:
             toks = [torch.zeros(1, model.cls_token.shape[-1], device=device, dtype=dtype)]
-        mem_tokens.append(torch.cat(toks, dim=0))  # [S_i, D]
+        seq = torch.cat(toks, dim=0)
+        if hasattr(model, "apply_memory_positional_encoding"):
+            seq = model.apply_memory_positional_encoding(seq)
+        mem_tokens.append(seq)  # [S_i, D]
 
     S_max = max(t.shape[0] for t in mem_tokens)
     D = mem_tokens[0].shape[-1]
@@ -536,15 +660,15 @@ def model_forward_log1p_pred(model: GraphCardinalityEstimatorMultiSubgraph,
     mem = torch.cat([cls_tok, mem_core], dim=1)   # [B,1+S_max,D]
 
     # === key padding mask (True=padding) ===
-    valid_lens = torch.tensor([1 + s for s in valid_S], device=device)  # +1 for cls
+    valid_lens = torch.tensor([1 + s for s in valid_S], device=device, dtype=torch.long)  # +1 for cls
     S_full = mem.size(1)
     ar = torch.arange(S_full, device=device).unsqueeze(0).expand(B, S_full)
     src_key_padding_mask = ar >= valid_lens.unsqueeze(1)   # [B, S_full] bool
 
-    mem_norm = getattr(model, "mem_norm", nn.Identity())
-    mem = mem_norm(mem)
     if hasattr(model, "transformer_encoder"):
         mem = model.transformer_encoder(mem, src_key_padding_mask=src_key_padding_mask)
+    mem_norm = getattr(model, "mem_norm", nn.Identity())
+    mem = mem_norm(mem)
 
     # === query token: [B,1,D] ===
     q_toks = []
@@ -566,10 +690,12 @@ def model_forward_log1p_pred(model: GraphCardinalityEstimatorMultiSubgraph,
     query_norm = getattr(model, "query_norm", nn.Identity())
     tgt = query_norm(tgt)
 
-    if hasattr(model, "transformer_decoder"):
-        tgt = model.transformer_decoder(tgt, mem, memory_key_padding_mask=src_key_padding_mask)  # [B,1,D]
+    if hasattr(model, "cross_interact"):
+        fused = model.cross_interact(mem, tgt, memory_key_padding_mask=src_key_padding_mask)
+    else:
+        fused = tgt
 
-    log1p_pred = model.head(tgt.squeeze(1)).squeeze(-1)  # [B]
+    log1p_pred = model.head(fused.squeeze(1)).squeeze(-1)  # [B]
     return log1p_pred
 
 # ---------------- 校准层 ----------------
@@ -812,7 +938,8 @@ def test(model, loader, device: torch.device, out_path: str = "predictions_and_l
 
 # ---------------- 主流程 ----------------
 def main():
-    global GLOBAL_NUM_VERTICES, GLOBAL_NUM_LABELS
+    global CONFIG, GLOBAL_NUM_VERTICES, GLOBAL_NUM_LABELS
+    CONFIG.update(_bind_output_paths_to_selected_num(_apply_dataset(CONFIG)))
     C = CONFIG
     torch.manual_seed(C["SEED"]); np.random.seed(C["SEED"])
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(C["SEED"])
@@ -1067,4 +1194,6 @@ def main():
     print("\nAll done.")
 
 if __name__ == "__main__":
+    parsed_args = _parse_args()
+    _apply_cli_overrides(parsed_args)
     main()
