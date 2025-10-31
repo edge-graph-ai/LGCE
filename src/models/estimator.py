@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .attention import TokenAttentionPool
+from .attention import MultiScaleTokenPool
 from .GNN import GINEncoder
 
 def _maybe_log1p_degree(deg_tensor):
@@ -61,7 +61,14 @@ class GraphCardinalityEstimatorMultiSubgraph(nn.Module):
                  transformer_dim: int = 16, transformer_heads: int = 4, transformer_ffn_dim: int = 32,
                  transformer_layers: int = 2, num_subgraphs: int = 8,
                  num_vertices: int = 100_000, num_labels: int = 64,
-                 dropout: float = 0.1):
+                 dropout: float = 0.1,
+                 enable_embed_shortcut: bool = True,
+                 embed_shortcut_init: float = 0.0,
+                 use_multi_scale_pool: bool = True,
+                 multi_scale_fusion: str = "gate",
+                 multi_scale_dropout: float | None = None,
+                 multi_scale_gate_init: float = 0.0,
+                 multi_scale_attn_hidden: int | None = None):
         super().__init__()
 
         D = transformer_dim
@@ -76,12 +83,50 @@ class GraphCardinalityEstimatorMultiSubgraph(nn.Module):
             jk_mode="sum", residual=True, train_eps=True
         )
 
-        self.pool_data  = TokenAttentionPool(gnn_out_ch, attn_hidden=D, dropout=dropout)
-        self.pool_query = TokenAttentionPool(gnn_out_ch, attn_hidden=D, dropout=dropout)
+        ms_attn_hidden = multi_scale_attn_hidden if multi_scale_attn_hidden is not None else D
+        ms_dropout = multi_scale_dropout if multi_scale_dropout is not None else dropout
+        self.pool_data = MultiScaleTokenPool(
+            gnn_out_ch,
+            attn_hidden=ms_attn_hidden,
+            dropout=dropout,
+            enabled=use_multi_scale_pool,
+            fusion=multi_scale_fusion,
+            gate_init=multi_scale_gate_init,
+            fusion_dropout=ms_dropout,
+        )
+        self.pool_query = MultiScaleTokenPool(
+            gnn_out_ch,
+            attn_hidden=ms_attn_hidden,
+            dropout=dropout,
+            enabled=use_multi_scale_pool,
+            fusion=multi_scale_fusion,
+            gate_init=multi_scale_gate_init,
+            fusion_dropout=ms_dropout,
+        )
 
         # ★ 新增：池化温度（正值）。softplus 保证 >0，初值≈1.1，让注意力更“尖锐”
         self._pool_scale_data  = nn.Parameter(torch.tensor(0.2))
         self._pool_scale_query = nn.Parameter(torch.tensor(0.2))
+
+        # ★ 嵌入捷径门控
+        def _make_shortcut_layer():
+            if int(gnn_in_ch) == int(gnn_out_ch):
+                return nn.Identity()
+            layer = nn.Linear(gnn_in_ch, gnn_out_ch)
+            nn.init.xavier_uniform_(layer.weight)
+            nn.init.zeros_(layer.bias)
+            return layer
+
+        self.enable_embed_shortcut = bool(enable_embed_shortcut)
+        self.shortcut_proj_data = _make_shortcut_layer()
+        self.shortcut_proj_query = _make_shortcut_layer()
+        self._shortcut_gate_act = nn.Sigmoid()
+        if self.enable_embed_shortcut:
+            self.embed_shortcut_alpha_data = nn.Parameter(torch.tensor(float(embed_shortcut_init)))
+            self.embed_shortcut_alpha_query = nn.Parameter(torch.tensor(float(embed_shortcut_init)))
+        else:
+            self.embed_shortcut_alpha_data = None
+            self.embed_shortcut_alpha_query = None
 
         # 原有投影（保留，兼容你的外部 fallback 调用）
         self.project = nn.Sequential(
@@ -129,16 +174,24 @@ class GraphCardinalityEstimatorMultiSubgraph(nn.Module):
         self.num_labels   = num_labels
 
     def forward_memory_token_from_subgraph(self, vertex_ids, labels, degree, edge_index=None, batch: torch.Tensor | None = None):
-        x = self.embed.forward_data(vertex_ids, labels, degree)  # [N,C]
-        x = self.gnn_encoder_data(x, edge_index)                 # [N,C]
+        embed_x = self.embed.forward_data(vertex_ids, labels, degree)  # [N,C]
+        x = self.gnn_encoder_data(embed_x, edge_index)                 # [N,C]
+        if self.enable_embed_shortcut:
+            shortcut = self.shortcut_proj_data(embed_x)
+            gate = self._shortcut_gate_act(self.embed_shortcut_alpha_data)
+            x = gate * x + (1.0 - gate) * shortcut
         # ★ 池化前做可学习缩放，促使注意力分布更尖锐
         x = x * F.softplus(self._pool_scale_data)
         pooled = self.pool_data(x)                               # [1,C]
         return self.project(pooled)                              # [1,D]
 
     def forward_query_token(self, labels, degree, edge_index=None, batch: torch.Tensor | None = None):
-        xq = self.embed.forward_query(labels, degree)            # [N,C]
-        xq = self.gnn_encoder_query(xq, edge_index)              # [N,C]
+        embed_q = self.embed.forward_query(labels, degree)            # [N,C]
+        xq = self.gnn_encoder_query(embed_q, edge_index)              # [N,C]
+        if self.enable_embed_shortcut:
+            shortcut = self.shortcut_proj_query(embed_q)
+            gate = self._shortcut_gate_act(self.embed_shortcut_alpha_query)
+            xq = gate * xq + (1.0 - gate) * shortcut
         xq = xq * F.softplus(self._pool_scale_query)
         pooled = self.pool_query(xq)                             # [1,C]
         return self.project(pooled)                              # [1,D]

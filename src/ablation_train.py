@@ -14,6 +14,11 @@ import torch.nn as nn
 from torch import amp
 from torch.utils.data import WeightedRandomSampler
 
+try:
+    import yaml
+except ImportError:  # pragma: no cover
+    yaml = None
+
 # ========= 路径初始化 =========
 THIS = os.path.abspath(os.path.dirname(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(THIS, ".."))
@@ -234,6 +239,14 @@ CONFIG = dict(
     HEAD_LR_MULT    = 10.0,
     QERR_CLIP_MAX   = 1e4,
 
+    ENABLE_EMBED_SHORTCUT = True,
+    EMBED_SHORTCUT_INIT   = 0.0,
+    USE_MULTI_SCALE_POOL  = True,
+    MULTI_SCALE_FUSION    = "gate",
+    MULTI_SCALE_DROPOUT   = None,
+    MULTI_SCALE_GATE_INIT = 0.0,
+    MULTI_SCALE_ATTN_HIDDEN = None,
+
     # —— 三损失权重（可按需调整）——
     LAMBDA_MSLE        = 0.2,
     LAMBDA_QERR_MEAN   = 0.6,
@@ -298,6 +311,41 @@ CONFIG = _bind_output_paths_to_selected_num(_apply_dataset(CONFIG))
 
 GLOBAL_NUM_VERTICES = None
 GLOBAL_NUM_LABELS   = None
+
+
+def _load_yaml_config(path: str) -> dict:
+    if not path:
+        return {}
+    if yaml is None:
+        raise RuntimeError("PyYAML is required to load YAML config files. Please install 'pyyaml' or avoid using --config.")
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"YAML config must be a mapping, got {type(data)!r}")
+    return data
+
+
+def _apply_cli_overrides(args):
+    if args is None:
+        return
+    if getattr(args, "config", None):
+        CONFIG.update(_load_yaml_config(args.config))
+    if getattr(args, "enable_shortcut", None) is not None:
+        CONFIG["ENABLE_EMBED_SHORTCUT"] = bool(args.enable_shortcut)
+    if getattr(args, "shortcut_init", None) is not None:
+        CONFIG["EMBED_SHORTCUT_INIT"] = float(args.shortcut_init)
+    if getattr(args, "enable_multi_scale", None) is not None:
+        CONFIG["USE_MULTI_SCALE_POOL"] = bool(args.enable_multi_scale)
+    if getattr(args, "multi_scale_fusion", None):
+        CONFIG["MULTI_SCALE_FUSION"] = str(args.multi_scale_fusion)
+    if getattr(args, "multi_scale_dropout", None) is not None:
+        CONFIG["MULTI_SCALE_DROPOUT"] = float(args.multi_scale_dropout)
+    if getattr(args, "multi_scale_gate_init", None) is not None:
+        CONFIG["MULTI_SCALE_GATE_INIT"] = float(args.multi_scale_gate_init)
+    if getattr(args, "multi_scale_attn_hidden", None) is not None:
+        CONFIG["MULTI_SCALE_ATTN_HIDDEN"] = int(args.multi_scale_attn_hidden)
 
 # ---------------- 工具 ----------------
 def resolve_query_dir(query_root: str, query_num_dir: int | None, query_dir: str | None) -> str:
@@ -564,6 +612,13 @@ def build_model(device, data_graph, num_subgraphs: int):
         num_vertices=data_graph.num_vertices,
         num_labels=getattr(data_graph, "num_labels", 64),
         dropout=0.05,
+        enable_embed_shortcut=CONFIG.get("ENABLE_EMBED_SHORTCUT", True),
+        embed_shortcut_init=CONFIG.get("EMBED_SHORTCUT_INIT", 0.0),
+        use_multi_scale_pool=CONFIG.get("USE_MULTI_SCALE_POOL", True),
+        multi_scale_fusion=CONFIG.get("MULTI_SCALE_FUSION", "gate"),
+        multi_scale_dropout=CONFIG.get("MULTI_SCALE_DROPOUT", None),
+        multi_scale_gate_init=CONFIG.get("MULTI_SCALE_GATE_INIT", 0.0),
+        multi_scale_attn_hidden=CONFIG.get("MULTI_SCALE_ATTN_HIDDEN", None),
     )
     variant = CONFIG.get("MODEL_VARIANT", "BASE")
     model = make_ablation_model(variant, **cfg).to(device)
@@ -1036,11 +1091,32 @@ def test(model, loader, device: torch.device, out_path: str = "predictions_and_l
 # ---------------- 主流程 ----------------
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML config file overriding defaults")
+    parser.add_argument("--enable-shortcut", dest="enable_shortcut", action="store_true",
+                        help="Force enable embed shortcut gating")
+    parser.add_argument("--disable-shortcut", dest="enable_shortcut", action="store_false",
+                        help="Disable embed shortcut gating")
+    parser.add_argument("--shortcut-init", type=float, default=None,
+                        help="Initial logit for embed shortcut gate")
+    parser.add_argument("--enable-multi-scale", dest="enable_multi_scale", action="store_true",
+                        help="Enable multi-scale pooling wrapper")
+    parser.add_argument("--disable-multi-scale", dest="enable_multi_scale", action="store_false",
+                        help="Disable multi-scale pooling wrapper")
+    parser.add_argument("--multi-scale-fusion", type=str, choices=["gate", "concat"], default=None,
+                        help="Fusion strategy between pooling branches")
+    parser.add_argument("--multi-scale-dropout", type=float, default=None,
+                        help="Dropout applied on fused multi-scale features")
+    parser.add_argument("--multi-scale-gate-init", type=float, default=None,
+                        help="Initial logit for multi-scale fusion gate")
+    parser.add_argument("--multi-scale-attn-hidden", type=int, default=None,
+                        help="Hidden size for attention pooling within multi-scale module")
     parser.add_argument(
         "--variant", type=str, default=None,
         help="选择消融：BASE | NO_GIN | NO_ATTENTION | NO_GIN_NO_ATTENTION （兼容：NO_ENCODER | NO_DECODER）"
     )
+    parser.set_defaults(enable_shortcut=None, enable_multi_scale=None)
     args = parser.parse_args()
+    _apply_cli_overrides(args)
     if args.variant:
         CONFIG["MODEL_VARIANT"] = args.variant
     CONFIG.update(_bind_output_paths_to_selected_num(_apply_dataset(CONFIG)))
