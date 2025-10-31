@@ -157,14 +157,15 @@ class GraphCE_NoAllAttention(GraphCardinalityEstimatorMultiSubgraph):
             self.query_token.requires_grad = False
         except Exception:
             pass
-
 class GraphCE_NoGINNoAttention(GraphCardinalityEstimatorMultiSubgraph):
     """
-    同时去掉 GIN + 所有注意力：
-      - gnn_encoder_* -> Identity(in_ch->out_ch)
-      - 注意力池化 -> 均值池化
-      - TransformerEncoder/Decoder -> Identity
+    同时移除 GIN 与所有注意力：
+      - gnn_encoder_* -> 恒等线性投影
+      - 注意力池化 -> 均值
+      - TransformerEncoder -> 恒等
+      - 交叉注意力 -> 关闭
       - cls/query token 清零并冻结
+      - 关闭记忆位置编码
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -184,9 +185,11 @@ class GraphCE_NoGINNoAttention(GraphCardinalityEstimatorMultiSubgraph):
         self.cross_attn_norm = nn.Identity()
         self.cross_ffn_norm = nn.Identity()
 
-    def cross_interact(self, memory, query, memory_key_padding_mask=None):
-        return query
+        # 关闭记忆位置编码（更“纯”的去注意力）
+        if hasattr(self, "apply_memory_positional_encoding") and callable(self.apply_memory_positional_encoding):
+            self.apply_memory_positional_encoding = (lambda x: x)
 
+        # 清零并冻结 tokens
         with torch.no_grad():
             if isinstance(self.cls_token, torch.Tensor):
                 self.cls_token.zero_()
@@ -197,6 +200,10 @@ class GraphCE_NoGINNoAttention(GraphCardinalityEstimatorMultiSubgraph):
             self.query_token.requires_grad = False
         except Exception:
             pass
+
+    def cross_interact(self, memory, query, memory_key_padding_mask=None):
+        return query
+
 
 def make_ablation_model(variant: str, **cfg):
     """
@@ -225,7 +232,7 @@ def make_ablation_model(variant: str, **cfg):
 
 # ========= 配置 =========
 CONFIG = dict(
-    DATASET        = "eu2005",
+    DATASET        = "youtube",
     DATA_GRAPH     = None,
     MATCHES_PATH   = None,
     PREPARED_OUT   = None,
@@ -233,7 +240,7 @@ CONFIG = dict(
     QUERY_ROOT     = None,
     QUERY_NUM_DIR  = None,
 
-    SELECTED_QUERY_NUM = 8,
+    SELECTED_QUERY_NUM = 32,
 
     DEVICE         = "cuda",
     SEED           = 42,
