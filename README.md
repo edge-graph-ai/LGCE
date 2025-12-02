@@ -19,7 +19,7 @@ Tested with:
 - Python ≥ 3.10
 - PyTorch ≥ 2.0
 - CUDA 12.x
-- PyTorch Geometric (PyG)
+- PyTorch Geometric
 
 Clone the repository and install dependencies:
 - git clone https://github.com/edge-graph-ai/LGCE.git
@@ -42,7 +42,7 @@ Optimizer: AdamW
 
 Initial learning rate: 1e-4  
 
-Batch size: 8 (for both pre-training and fine-tuning, unless otherwise specified in the configs)  
+Batch size: 8 
 
 Max epochs: 50  
 
