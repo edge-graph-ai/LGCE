@@ -1,29 +1,25 @@
-# -*- coding: utf-8 -*-
-import argparse
 import os
-
-from src.utils.splits_and_sampling import build_weighted_loader, make_splits_indices_stratified
-
-from torch.optim.swa_utils import AveragedModel
-os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
-
-import sys, importlib, importlib.util, inspect, glob, time
+import sys
+import importlib
+import importlib.util
+import inspect
+import glob
+import time
+import argparse
 from pathlib import Path
 import numpy as np
 from tqdm import tqdm
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import amp
 from torch.utils.data import WeightedRandomSampler
 
 try:
     import yaml
-except ImportError:  # pragma: no cover - optional dependency for CLI config
+except ImportError:  # pragma: no cover
     yaml = None
 
-# --------- 解决 "No module named 'src'" ----------
+# ========= 路径初始化 =========
 THIS = os.path.abspath(os.path.dirname(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(THIS, ".."))
 SRC_PATH = os.path.join(PROJECT_ROOT, "src")
@@ -58,36 +54,211 @@ from src.models.estimator import GraphCardinalityEstimatorMultiSubgraph
 from src.utils.earlystop import EarlyStopping
 # =====================
 
-USE_AMP = True
+USE_AMP = False
 
-# ----------------- 全局配置（按需手动改） -----------------
+# 防止梯度爆炸：梯度裁剪
+def clip_gradients(model, max_norm=10.0):
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+
+# 确保 log1p_pred 不为 0 或负数
+def sanitize_log1p_pred(log1p_pred: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    return torch.clamp(log1p_pred, min=eps)
+
+# 检测数据不一致（NaN 或 inf）
+def check_invalid_data(tensor: torch.Tensor) -> bool:
+    return torch.isnan(tensor).any() or torch.isinf(tensor).any()
+
+# ========= 消融变体（内置于本文件） =========
+class _IdentityGNN(nn.Module):
+    """
+    恒等“GNN”，同时负责把 embed 的维度 in_ch 投到 gnn_out_ch：
+      x: [N, in_ch] -> proj -> [N, out_ch]
+    这样就能无缝对接 TokenAttentionPool(out_ch) 与 project(out_ch->D)。
+    """
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        if int(in_ch) == int(out_ch):
+            self.proj = nn.Identity()
+        else:
+            self.proj = nn.Linear(in_ch, out_ch)
+            nn.init.xavier_uniform_(self.proj.weight)
+            nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x, edge_index=None, *args, **kwargs):
+        return self.proj(x)
+
+class _IdentityEncoder(nn.Module):
+    def forward(self, src, *args, **kwargs):
+        return src
+
+class _MeanPool(nn.Module):
+    """简单均值池化：将 [N,D] -> [1,D]"""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.mean(dim=0, keepdim=True)
+
+class GraphCE_NoGIN(GraphCardinalityEstimatorMultiSubgraph):
+    """取消 GIN：不做消息传递，仅用嵌入(+线性投影) + 池化"""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        in_ch  = int(getattr(self.embed, "dim", self.project[2].in_features))
+        out_ch = int(self.project[2].in_features)  # project 的输入通道 = gnn_out_ch
+        self.gnn_encoder_data  = _IdentityGNN(in_ch, out_ch)
+        self.gnn_encoder_query = _IdentityGNN(in_ch, out_ch)
+
+class GraphCE_NoSelfAttn(GraphCardinalityEstimatorMultiSubgraph):
+    """取消自注意力（TransformerEncoder）"""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.transformer_encoder = _IdentityEncoder()
+
+class GraphCE_NoCrossAttn(GraphCardinalityEstimatorMultiSubgraph):
+    """取消查询-记忆的轻量跨注意力交互"""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.enable_cross_attention = False
+        self.cross_attn = None
+        self.cross_ffn = nn.Identity()
+        self.cross_attn_norm = nn.Identity()
+        self.cross_ffn_norm = nn.Identity()
+
+    def cross_interact(self, memory, query, memory_key_padding_mask=None):
+        return query
+
+class GraphCE_NoAllAttention(GraphCardinalityEstimatorMultiSubgraph):
+    """
+    取消所有注意力机制：
+      - 注意力池化 -> 均值池化
+      - TransformerEncoder/Decoder -> Identity
+      - cls/query token 清零并冻结
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # 1) 池化改为均值，不再使用注意力池化
+        self.pool_data  = _MeanPool()
+        self.pool_query = _MeanPool()
+
+        # 2) 关闭所有 Transformer 注意力
+        self.transformer_encoder = _IdentityEncoder()
+        self.enable_cross_attention = False
+        self.cross_attn = None
+        self.cross_ffn = nn.Identity()
+        self.cross_attn_norm = nn.Identity()
+        self.cross_ffn_norm = nn.Identity()
+
+        # 3) 将 cls/query token 清零并冻结
+        with torch.no_grad():
+            if isinstance(self.cls_token, torch.Tensor):
+                self.cls_token.zero_()
+            if isinstance(self.query_token, torch.Tensor):
+                self.query_token.zero_()
+        try:
+            self.cls_token.requires_grad = False
+            self.query_token.requires_grad = False
+        except Exception:
+            pass
+class GraphCE_NoGINNoAttention(GraphCardinalityEstimatorMultiSubgraph):
+    """
+    同时移除 GIN 与所有注意力：
+      - gnn_encoder_* -> 恒等线性投影
+      - 注意力池化 -> 均值
+      - TransformerEncoder -> 恒等
+      - 交叉注意力 -> 关闭
+      - cls/query token 清零并冻结
+      - 关闭记忆位置编码
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        in_ch  = int(getattr(self.embed, "dim", self.project[2].in_features))
+        out_ch = int(self.project[2].in_features)
+        self.gnn_encoder_data  = _IdentityGNN(in_ch, out_ch)
+        self.gnn_encoder_query = _IdentityGNN(in_ch, out_ch)
+
+        self.pool_data  = _MeanPool()
+        self.pool_query = _MeanPool()
+
+        self.transformer_encoder = _IdentityEncoder()
+        self.enable_cross_attention = False
+        self.cross_attn = None
+        self.cross_ffn = nn.Identity()
+        self.cross_attn_norm = nn.Identity()
+        self.cross_ffn_norm = nn.Identity()
+
+        # 关闭记忆位置编码（更“纯”的去注意力）
+        if hasattr(self, "apply_memory_positional_encoding") and callable(self.apply_memory_positional_encoding):
+            self.apply_memory_positional_encoding = (lambda x: x)
+
+        # 清零并冻结 tokens
+        with torch.no_grad():
+            if isinstance(self.cls_token, torch.Tensor):
+                self.cls_token.zero_()
+            if isinstance(self.query_token, torch.Tensor):
+                self.query_token.zero_()
+        try:
+            self.cls_token.requires_grad = False
+            self.query_token.requires_grad = False
+        except Exception:
+            pass
+
+    def cross_interact(self, memory, query, memory_key_padding_mask=None):
+        return query
+
+
+def make_ablation_model(variant: str, **cfg):
+    """
+    选择消融变体：
+      - 'BASE'         : 全部模块启用
+      - 'NO_GIN'       : 去除 GIN（仅嵌入(+线性投影) + 池化）
+      - 'NO_ATTENTION' : 去除所有注意力（自注意力、交叉注意力、注意力池化）
+      - 'NO_GIN_NO_ATTENTION' : 同时去掉 GIN + 所有注意力
+    兼容旧别名：'NO_ENCODER' / 'NO_DECODER' 等
+    """
+    v = (variant or "BASE").strip().upper()
+    if v == "BASE":
+        return GraphCardinalityEstimatorMultiSubgraph(**cfg)
+    if v in ("NO_GIN", "NOGIN", "-GIN"):
+        return GraphCE_NoGIN(**cfg)
+    if v in ("NO_ATTENTION", "NO_ALL_ATTN", "NO_ATTN", "NA", "-ATTN", "NO_ALL_ATTENTION"):
+        return GraphCE_NoAllAttention(**cfg)
+    if v in ("NO_GIN_NO_ATTENTION", "NO_GIN_ATTENTION", "NO_GIN_ALL_OFF", "NOGIN_NOATTN"):
+        return GraphCE_NoGINNoAttention(**cfg)
+    if v in ("NO_ENCODER", "NO_SELF_ATTN", "NOSELFATTN", "-ENCODER"):
+        return GraphCE_NoSelfAttn(**cfg)
+    if v in ("NO_DECODER", "NO_CROSS_ATTN", "NOCROSSATTN", "-DECODER"):
+        return GraphCE_NoCrossAttn(**cfg)
+
+    raise ValueError(f"Unknown MODEL_VARIANT: {variant}")
+
+# ========= 配置 =========
 CONFIG = dict(
     DATASET        = "yeast",
     DATA_GRAPH     = None,
     MATCHES_PATH   = None,
     PREPARED_OUT   = None,
-    QUERY_DIR      = None,       # 显式指定查询根目录（优先级更高）
-    QUERY_ROOT     = None,       # 缺省使用 data/train_data/{ds}/query_graph
-    QUERY_NUM_DIR  = None,       # 若设置，使用 query_root/query_{k}
+    QUERY_DIR      = None,
+    QUERY_ROOT     = None,
+    QUERY_NUM_DIR  = None,
 
-    SELECTED_QUERY_NUM = 32,     # 仅用于 fine-tune 的查询大小（例如 4/8/12/...）
+    SELECTED_QUERY_NUM = 24,
 
     DEVICE         = "cuda",
     SEED           = 42,
-    BATCH_SIZE     = 32,
-    LR             = 1e-4,
+    BATCH_SIZE     = 64,
+    LR             = 1e-3,
     WEIGHT_DECAY   = 1e-4,
-    EPOCHS_PRE     = 100,
-    EPOCHS_FT      = 100,
+    EPOCHS_PRE     = 50,
+    EPOCHS_FT      = 50,
     PATIENCE       = 10,
-    PRETRAIN_RATIO = 0.20,       # 20% 全部查询做预训练
+    PRETRAIN_RATIO = 0.20,
     K_FOLDS        = 5,
     EXCLUDE_OVERLAP= True,
     NUM_WORKERS    = 0,
     PIN_MEMORY     = False,
 
-    USE_MEDIAN_BIAS = True,      # 用 median(log1p(y)) 设 head.bias
+    USE_MEDIAN_BIAS = True,
     HEAD_LR_MULT    = 10.0,
+    QERR_CLIP_MAX   = 1e4,
 
     ENABLE_EMBED_SHORTCUT = True,
     EMBED_SHORTCUT_INIT   = 0.0,
@@ -97,38 +268,33 @@ CONFIG = dict(
     MULTI_SCALE_GATE_INIT = 0.0,
     MULTI_SCALE_ATTN_HIDDEN = None,
 
-    ENABLE_CROSS_ATTENTION = True,   # 轻量跨注意力：查询 token 从 memory token 中读信息
+    ENABLE_CROSS_ATTENTION = True,  # 查询 token 是否通过轻量跨注意力读取 memory token
     CROSS_ATTN_HEADS        = 1,
     CROSS_ATTN_DROPOUT      = None,
     CROSS_FFN_HIDDEN        = None,
-    USE_MEMORY_POS_ENCODING = True,  # 是否为子图 token 注入顺序位置编码
+    USE_MEMORY_POS_ENCODING = True,  # 是否注入可学习的子图顺序编码
 
-    W_MSLE     = 0.2,   # ↓
-    W_QERR     = 0.6,   # ↑ 让相对误差成为主损失
-    W_LOGHUBER = 0.2,   # ↑ 让鲁棒的方向性惩罚有存在感
-    LOG_HUBER_DELTA = 0.25,   # 稍小一些，更像L1，拉开分布
-    TRIM_RATIO     = 0.05 ,   # 少量修剪，留出“拉开的”梯度
+    # —— 三损失权重（可按需调整）——
+    LAMBDA_MSLE        = 0.2,
+    LAMBDA_QERR_MEAN   = 0.6,
+    LAMBDA_SIGNED_LOGQ = 0.2,
 
-    TAIL_QERR_LOG10_THRESH  = 4.0,   # 约等于 QErr >= 1e4 时触发额外惩罚
+    # robust signed log10(qerr) 的配置
+    LOG_HUBER_DELTA = 0.25,
+    TRIM_RATIO      = 0.05,
+
+    TAIL_QERR_LOG10_THRESH   = 4.0,  # 约等于 QErr >= 1e4 时触发额外惩罚
     TAIL_QERR_PENALTY_WEIGHT = 0.3,
     TAIL_QERR_PENALTY_POWER  = 2.0,
-
-    # 训练中 QErr 的裁剪上界，避免梯度爆炸；测试阶段不裁剪
-    QERR_CLIP_MAX   = 1e5,
-
 
     STRATA_NUM_BINS = 5,
     USE_WEIGHTED_SAMPLER = True,
     SAMPLE_REPLACEMENT  = True,
 
-    ENABLE_TAIL_SAMPLE_REWEIGHT   = True,
-    TAIL_SAMPLE_REWEIGHT_PCT      = 0.15,   # 针对 top-15% 高 QErr 样本调高权重
-    TAIL_SAMPLE_REWEIGHT_FACTOR   = 3.0,
-    TAIL_SAMPLE_REWEIGHT_MIN_QERR = 5.0,
-
     USE_CALIBRATOR      = False,
     CALIB_LR_MULT       = 15.0,
-    WARMUP_HEAD_EPOCHS  = 5,     # 仅训练 head + calibrator 的轮数
+    CALIB_REG           = 1e-4,
+    WARMUP_HEAD_EPOCHS  = 5,
 
     LR_WARMUP_EPOCHS    = 5,
 
@@ -137,8 +303,10 @@ CONFIG = dict(
     BEST_FOLD_PATH_TPL = "best_model_fold{fold}.pth",
     PRED_TXT_TPL       = "predictions_fold{fold}.txt",
     RESULT_DIR         = None,
+
+    # ★ 选择消融变体
+    MODEL_VARIANT      = "BASE",
 )
-# ---------------------------------------------------------
 
 def _apply_dataset(C: dict) -> dict:
     ds = C["DATASET"]
@@ -153,14 +321,16 @@ def _apply_dataset(C: dict) -> dict:
     return C
 
 def _bind_output_paths_to_selected_num(C: dict) -> dict:
+    """
+    输出根目录：ablation/<dataset>/<variant>/<qnum>/
+    文件名不再追加变体后缀，避免重复。
+    """
     ds = C["DATASET"]
     n  = C["SELECTED_QUERY_NUM"]
-
-    # 新增：从环境变量读取 run tag（每次调参自动传入）
-    tag = os.getenv("RUN_TAG", "").strip()
-    suffix = f"_{tag}" if tag else ""
-    out_dir = os.path.join("result", ds, f"{n}{suffix}")  # <- 带上 suffix
+    variant = (C.get("MODEL_VARIANT") or "BASE").strip().lower().replace(" ", "_")
+    out_dir = os.path.join("ablation", ds, variant, str(n))
     os.makedirs(out_dir, exist_ok=True)
+
     C["PRETRAIN_WEIGHTS"]   = os.path.join(out_dir, f"pretrained_q{n}.pth")
     C["BEST_PRE_PATH"]      = os.path.join(out_dir, f"best_model_pretrain_q{n}.pth")
     C["BEST_FOLD_PATH_TPL"] = os.path.join(out_dir, f"best_model_q{n}_fold{{fold}}.pth")
@@ -217,50 +387,8 @@ def _apply_cli_overrides(args):
         CONFIG["CROSS_FFN_HIDDEN"] = int(args.cross_ffn_hidden)
     if getattr(args, "enable_mem_pos", None) is not None:
         CONFIG["USE_MEMORY_POS_ENCODING"] = bool(args.enable_mem_pos)
-
-
-def _parse_args():
-    parser = argparse.ArgumentParser(description="Train Graph Cardinality Estimator")
-    parser.add_argument("--config", type=str, default=None, help="Path to YAML config file to override defaults")
-    parser.add_argument("--enable-shortcut", dest="enable_shortcut", action="store_true",
-                        help="Force enable embed-to-pool shortcut gating")
-    parser.add_argument("--disable-shortcut", dest="enable_shortcut", action="store_false",
-                        help="Disable embed-to-pool shortcut gating")
-    parser.add_argument("--shortcut-init", type=float, default=None,
-                        help="Initial value (pre-sigmoid) for embed shortcut gate")
-    parser.add_argument("--enable-multi-scale", dest="enable_multi_scale", action="store_true",
-                        help="Enable multi-scale pooling wrapper")
-    parser.add_argument("--disable-multi-scale", dest="enable_multi_scale", action="store_false",
-                        help="Disable multi-scale pooling wrapper")
-    parser.add_argument("--multi-scale-fusion", type=str, choices=["gate", "concat"], default=None,
-                        help="Fusion strategy between attention and mean pooling")
-    parser.add_argument("--multi-scale-dropout", type=float, default=None,
-                        help="Dropout applied to the fused multi-scale representation")
-    parser.add_argument("--multi-scale-gate-init", type=float, default=None,
-                        help="Initial value (pre-sigmoid) for multi-scale fusion gate")
-    parser.add_argument("--multi-scale-attn-hidden", type=int, default=None,
-                        help="Hidden size used inside attention pooling when multi-scale is enabled")
-    parser.add_argument("--enable-cross-attn", dest="enable_cross_attn", action="store_true",
-                        help="Enable the lightweight cross-attention head between query and memory tokens")
-    parser.add_argument("--disable-cross-attn", dest="enable_cross_attn", action="store_false",
-                        help="Disable the lightweight cross-attention head")
-    parser.add_argument("--cross-attn-heads", type=int, default=None,
-                        help="Number of heads for the lightweight cross-attention")
-    parser.add_argument("--cross-attn-dropout", type=float, default=None,
-                        help="Dropout applied inside the lightweight cross-attention")
-    parser.add_argument("--cross-ffn-hidden", type=int, default=None,
-                        help="Hidden dim of the feed-forward layer after cross-attention")
-    parser.add_argument("--enable-mem-pos", dest="enable_mem_pos", action="store_true",
-                        help="Inject learnable positional encodings for subgraph memory tokens")
-    parser.add_argument("--disable-mem-pos", dest="enable_mem_pos", action="store_false",
-                        help="Do not add positional encodings to memory tokens")
-    parser.set_defaults(
-        enable_shortcut=None,
-        enable_multi_scale=None,
-        enable_cross_attn=None,
-        enable_mem_pos=None,
-    )
-    return parser.parse_args() if len(sys.argv) > 1 else parser.parse_args([])
+    if getattr(args, "selected_query_num", None) is not None:
+        CONFIG["SELECTED_QUERY_NUM"] = int(args.selected_query_num)
 
 # ---------------- 工具 ----------------
 def resolve_query_dir(query_root: str, query_num_dir: int | None, query_dir: str | None) -> str:
@@ -274,6 +402,7 @@ def resolve_query_dir(query_root: str, query_num_dir: int | None, query_dir: str
         qdir = query_root
         print(f"[QueryDir] 未指定 QUERY_DIR/QUERY_NUM_DIR，使用根目录（递归读取）: {qdir}")
     if not os.path.isdir(qdir):
+        print(qdir)
         raise RuntimeError(f"查询目录不存在: {qdir}")
     n_graphs = len(glob.glob(os.path.join(qdir, "**", "*.graph"), recursive=True))
     if n_graphs == 0:
@@ -285,7 +414,7 @@ def _sanitize_tensor_(t: torch.Tensor, is_degree: bool = False) -> torch.Tensor:
     if t is None or not torch.is_tensor(t): return t
     if is_degree:
         t = t.float()
-        t = torch.clamp(t, min=0.0)  # 统一允许 0 度
+        t = torch.clamp(t, min=1.0)
     if t.is_floating_point():
         bad_mask = ~torch.isfinite(t)
         if bad_mask.any():
@@ -489,20 +618,6 @@ def _clamp_ids_inplace(model: GraphCardinalityEstimatorMultiSubgraph, subgraphs_
         if "edge_index" in q and "labels" in q:
             q["edge_index"] = _filter_edge_index(q["edge_index"], int(q["labels"].size(0)))
 
-def _batch_has_non_finite(subgraphs_batch, queries, y) -> bool:
-    def bad(x: torch.Tensor) -> bool:
-        if not torch.is_tensor(x): return False
-        if not x.is_floating_point(): return False
-        return (~torch.isfinite(x)).any().item()
-    for subs in subgraphs_batch:
-        for g in subs:
-            for k in ("vertex_ids", "labels", "edge_index", "degree"):
-                if k in g and bad(g[k]): return True
-    for q in queries:
-        for k in ("labels", "edge_index", "degree"):
-            if k in q and bad(q[k]): return True
-    return bad(y)
-
 def move_batch_to_device(data_graph_batch, query_batch, y, device):
     for subs in data_graph_batch:
         for g in subs:
@@ -531,82 +646,12 @@ def move_batch_to_device(data_graph_batch, query_batch, y, device):
             q["degree"] = q["degree"].to(device, non_blocking=True)
     return data_graph_batch, query_batch, y
 
-# ---------------- 组合损失：MSLE + mean QErr + Huber(|log10(QErr)|) ----------------
-def _huber(x: torch.Tensor, delta: float):
-    ax = torch.abs(x)
-    return torch.where(ax <= delta, 0.5 * (ax ** 2) / delta, ax - 0.5 * delta)
-
-def _trimmed_mean_loss(loss_vec: torch.Tensor, trim_ratio: float):
-    if trim_ratio <= 0.0 or loss_vec.numel() < 2:
-        return loss_vec.mean()
-    k = int((1.0 - trim_ratio) * loss_vec.numel())
-    k = max(1, min(k, loss_vec.numel()))
-    topk_vals, _ = torch.topk(loss_vec, k=k, largest=False, sorted=False)
-    return topk_vals.mean()
-
-def _qerror_tensor_from_log1p(log1p_pred: torch.Tensor, y: torch.Tensor, cap: float | None, eps: float = 1e-6):
-    pred  = torch.expm1(log1p_pred).clamp_min(1.0)
-    label = y.float().clamp_min(1.0)
-    ratio = (pred + eps) / (label + eps)
-    inv   = (label + eps) / (pred + eps)
-    qerr  = torch.maximum(ratio, inv)
-    if cap is not None:
-        qerr = torch.clamp(qerr, max=cap)
-    return qerr, pred, label
-
-def _signed_log10_qerr(qerr: torch.Tensor, pred: torch.Tensor, label: torch.Tensor, eps: float = 1e-6):
-    # qerr >= 1 by definition => log10(qerr) >= 0; 用 “有符号”的定义能稳定惩罚方向
-    sign = torch.sign(pred - label)
-    q = torch.clamp(qerr, min=1.0)
-    return sign * torch.log10(q)
-
-def composite_loss(log1p_pred: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, dict]:
-    """
-    返回 (total_loss, dict_of_components)
-    """
-    # MSLE：直接在 log1p 空间的 MSE
-    target_log1p = torch.log1p(y.float().clamp_min(0))
-    msle = F.mse_loss(log1p_pred, target_log1p)
-
-    # Q-Error（带上限裁剪，避免训练早期爆炸）
-    qerr, pred, label = _qerror_tensor_from_log1p(log1p_pred, y, cap=CONFIG["QERR_CLIP_MAX"])
-    mean_qerr = qerr.mean()
-
-    # Huber(|log10(QErr)|) 的鲁棒版本
-    signed_l10 = _signed_log10_qerr(qerr, pred, label)  # 可能正负
-    huber_raw  = _huber(signed_l10, delta=CONFIG["LOG_HUBER_DELTA"]).abs()  # 对称 => 取绝对
-    huber_logq = _trimmed_mean_loss(huber_raw, CONFIG["TRIM_RATIO"])
-
-    total = CONFIG["W_MSLE"] * msle + CONFIG["W_QERR"] * mean_qerr + CONFIG["W_LOGHUBER"] * huber_logq
-
-    tail_penalty = torch.zeros(1, device=log1p_pred.device, dtype=log1p_pred.dtype)
-    tail_weight = float(CONFIG.get("TAIL_QERR_PENALTY_WEIGHT", 0.0))
-    if tail_weight > 0:
-        log10_q = torch.log10(qerr.clamp_min(1.0))
-        thresh = float(CONFIG.get("TAIL_QERR_LOG10_THRESH", 1.0))
-        excess = F.relu(log10_q - thresh)
-        power = float(CONFIG.get("TAIL_QERR_PENALTY_POWER", 1.0))
-        if power != 1.0:
-            excess = excess.pow(power)
-        tail_penalty = excess.mean()
-        total = total + tail_weight * tail_penalty
-
-    parts = dict(msle=float(msle.item()),
-                 mean_qerr=float(mean_qerr.item()),
-                 huber_logq=float(huber_logq.item()),
-                 tail_penalty=float(tail_penalty.item()) if tail_weight > 0 else 0.0,
-                 total=float(total.item()))
-    return total, parts
-
 # ---------------- 模型与前向（log1p_pred） ----------------
 def build_model(device, data_graph, num_subgraphs: int):
-    
-
     cfg = dict(
-        gnn_in_ch=8, gnn_hidden_ch=16, gnn_out_ch=32, num_gnn_layers=2,
-        transformer_dim=64, transformer_heads=4, transformer_ffn_dim=128,
-        transformer_layers=2,
-        num_subgraphs=num_subgraphs,
+        gnn_in_ch=32, gnn_hidden_ch=32, gnn_out_ch=32, num_gnn_layers=2,
+        transformer_dim=32, transformer_heads=2, transformer_ffn_dim=64,
+        transformer_layers=1,num_subgraphs=num_subgraphs,
         num_vertices=data_graph.num_vertices,
         num_labels=getattr(data_graph, "num_labels", 64),
         dropout=0.05,
@@ -623,7 +668,9 @@ def build_model(device, data_graph, num_subgraphs: int):
         cross_ffn_hidden=CONFIG.get("CROSS_FFN_HIDDEN", None),
         use_memory_positional_encoding=CONFIG.get("USE_MEMORY_POS_ENCODING", True),
     )
-    model = GraphCardinalityEstimatorMultiSubgraph(**cfg).to(device)
+    variant = CONFIG.get("MODEL_VARIANT", "BASE")
+    model = make_ablation_model(variant, **cfg).to(device)
+
     def _init(m: nn.Module):
         if isinstance(m, nn.Linear):
             nn.init.xavier_uniform_(m.weight)
@@ -635,7 +682,6 @@ def model_forward_log1p_pred(model: GraphCardinalityEstimatorMultiSubgraph,
                              subgraphs_batch, queries) -> torch.Tensor:
     device = next(model.parameters()).device
     dtype  = next(model.parameters()).dtype
-
     _clamp_ids_inplace(model, subgraphs_batch, queries)
 
     # === memory tokens: [B, S, D] ===
@@ -647,19 +693,20 @@ def model_forward_log1p_pred(model: GraphCardinalityEstimatorMultiSubgraph,
                 ei = _filter_edge_index(g.get("edge_index"), int(g["labels"].size(0)))
                 tok = model.forward_memory_token_from_subgraph(
                     g["vertex_ids"], g["labels"], g.get("degree"), ei, None
-                )                  # [1,D]
+                )  # [1,D]
             else:
                 x = model.embed.forward_data(g["vertex_ids"], g["labels"], g.get("degree"))
                 if hasattr(model, "gnn_encoder_data"):
                     ei = _filter_edge_index(g.get("edge_index"), int(g["labels"].size(0)))
                     x = model.gnn_encoder_data(x, ei)
                 pooled = model.pool_data(x) if hasattr(model, "pool_data") else x.mean(0, keepdim=True)
-                tok = model.project(pooled)   # [1,D]
+                tok = model.project(pooled)  # [1,D]
             toks.append(tok)
         if not toks:
             toks = [torch.zeros(1, model.cls_token.shape[-1], device=device, dtype=dtype)]
         seq = torch.cat(toks, dim=0)
         if hasattr(model, "apply_memory_positional_encoding"):
+            # 与主训练脚本保持一致：让记忆 token 叠加位置编码后再进入 encoder
             seq = model.apply_memory_positional_encoding(seq)
         mem_tokens.append(seq)  # [S_i, D]
 
@@ -680,13 +727,12 @@ def model_forward_log1p_pred(model: GraphCardinalityEstimatorMultiSubgraph,
         cls_tok = model.cls_token.to(device=device, dtype=dtype).expand(B, 1, D)
     else:
         cls_tok = torch.zeros(B, 1, D, device=device, dtype=dtype)
-    mem = torch.cat([cls_tok, mem_core], dim=1)   # [B,1+S_max,D]
+    mem = torch.cat([cls_tok, mem_core], dim=1)  # [B,1+S,D]
 
-    # === key padding mask (True=padding) ===
-    valid_lens = torch.tensor([1 + s for s in valid_S], device=device, dtype=torch.long)  # +1 for cls
+    valid_lens = torch.tensor([1 + s for s in valid_S], device=device, dtype=torch.long)
     S_full = mem.size(1)
     ar = torch.arange(S_full, device=device).unsqueeze(0).expand(B, S_full)
-    src_key_padding_mask = ar >= valid_lens.unsqueeze(1)   # [B, S_full] bool
+    src_key_padding_mask = ar >= valid_lens.unsqueeze(1)
 
     if hasattr(model, "transformer_encoder"):
         mem = model.transformer_encoder(mem, src_key_padding_mask=src_key_padding_mask)
@@ -704,22 +750,175 @@ def model_forward_log1p_pred(model: GraphCardinalityEstimatorMultiSubgraph,
             if hasattr(model, "gnn_encoder_query"):
                 ei_q = _filter_edge_index(q.get("edge_index"), int(q["labels"].size(0)))
                 xq = model.gnn_encoder_query(xq, ei_q)
+
+            # ★ 新增：sanitize xq
+            if check_invalid_data(xq):
+                print(f"[WARN] xq contains NaN/Inf in query {q}. Replacing with zeros.")
+                xq = torch.where(torch.isfinite(xq), xq, torch.tensor(0.0, device=xq.device, dtype=xq.dtype))
+
             pooled_q = model.pool_query(xq) if hasattr(model, "pool_query") else xq.mean(0, keepdim=True)
             tok_q = model.project(pooled_q)
         q_toks.append(tok_q)  # [1,D]
+
     tgt = torch.stack([t.squeeze(0) for t in q_toks], dim=0).unsqueeze(1)  # [B,1,D]
     if hasattr(model, "query_token") and isinstance(model.query_token, torch.Tensor):
         tgt = tgt + model.query_token.to(device=device, dtype=dtype).expand_as(tgt)
+
     query_norm = getattr(model, "query_norm", nn.Identity())
     tgt = query_norm(tgt)
-
     if hasattr(model, "cross_interact"):
-        fused = model.cross_interact(mem, tgt, memory_key_padding_mask=src_key_padding_mask)
-    else:
-        fused = tgt
+        # 复用模型内定义的跨注意力/前馈交互逻辑（若变体关闭该模块则返回原查询 token）
+        tgt = model.cross_interact(mem, tgt, memory_key_padding_mask=src_key_padding_mask)
+    # 若模型未定义 cross_interact，则沿用原查询 token
 
-    log1p_pred = model.head(fused.squeeze(1)).squeeze(-1)  # [B]
+    # ===== 关键：检查 tgt 是否已异常 =====
+    if check_invalid_data(tgt):
+        print("[DEBUG] ❌ tgt contains NaN/Inf BEFORE head:")
+        print("tgt =", tgt)
+        raise ValueError("tgt contains NaN/Inf before head layer")
+
+    log1p_pred_raw = model.head(tgt.squeeze(1)).squeeze(-1)  # [B]
+
+
+    if check_invalid_data(log1p_pred_raw):
+        print("[DEBUG] ❌ log1p_pred_raw contains NaN/Inf:")
+        print("Raw values:", log1p_pred_raw.detach().cpu().numpy())
+        print("Is NaN:", torch.isnan(log1p_pred_raw).cpu().numpy())
+        print("Is Inf:", torch.isinf(log1p_pred_raw).cpu().numpy())
+        raise ValueError("log1p_pred_raw contains NaN/Inf before sanitize")
+
+    log1p_pred = sanitize_log1p_pred(log1p_pred_raw)
+
+    if check_invalid_data(log1p_pred):
+        print("[DEBUG] ❌ log1p_pred contains NaN/Inf AFTER sanitize (should not happen):")
+        print("Sanitized values:", log1p_pred.detach().cpu().numpy())
+        raise ValueError("log1p_pred contains NaN/Inf after sanitize")
+
     return log1p_pred
+
+# ---------------- 指标/损失 ----------------
+def _qerror_tensor_from_log1p(log1p_pred: torch.Tensor, y: torch.Tensor, cap: float | None, eps: float = 1e-6):
+    pred  = torch.expm1(log1p_pred).clamp_min(1.0)
+    label = y.float().clamp_min(1.0)
+    ratio = (pred + eps) / (label + eps)
+    inv   = (label + eps) / (pred + eps)
+    qerr  = torch.maximum(ratio, inv)
+    if cap is not None:
+        qerr = torch.clamp(qerr, max=cap)
+    return qerr, pred, label
+
+def _signed_log10_qerr(qerr: torch.Tensor, pred: torch.Tensor, label: torch.Tensor, eps: float = 1e-6):
+    sign = torch.sign(pred - label)
+    q = torch.clamp(qerr, min=1.0)
+    return sign * torch.log10(q)
+
+def _huber(x: torch.Tensor, delta: float):
+    ax = torch.abs(x)
+    return torch.where(ax <= delta, 0.5 * (ax ** 2) / delta, ax - 0.5 * delta)
+
+def _trimmed_mean_loss(loss_vec: torch.Tensor, trim_ratio: float):
+    if trim_ratio <= 0.0 or loss_vec.numel() < 2:
+        return loss_vec.mean()
+    k = int((1.0 - trim_ratio) * loss_vec.numel())
+    k = max(1, min(k, loss_vec.numel()))
+    topk_vals, _ = torch.topk(loss_vec, k=k, largest=False, sorted=False)
+    return topk_vals.mean()
+
+# ---------------- 划分/采样（略去未改动的函数，保持与你原先一致） ----------------
+def _parse_density_from_qid(qid: str) -> int:
+    low = qid.lower()
+    if "dense" in low:  return 1
+    if "sparse" in low: return 0
+    return -1
+
+def _digitize_by_quantiles(values: np.ndarray, n_bins: int) -> np.ndarray:
+    qs = np.linspace(0, 1, n_bins + 1)
+    cuts = np.quantile(values, qs)
+    cuts[0], cuts[-1] = -np.inf, np.inf
+    bins = np.digitize(values, cuts[1:-1], right=True)
+    return bins.astype(int)
+
+def make_splits_indices_stratified(prepared, selected_query_num, pretrain_ratio, k_folds, seed, exclude_overlap, n_bins):
+    rng = np.random.RandomState(seed)
+    n = len(prepared['query_ids'])
+    all_indices = np.arange(n)
+
+    pre_n = max(1, int(round(pretrain_ratio * n)))
+    pretrain_idx = rng.permutation(all_indices)[:pre_n].tolist()
+
+    qids = prepared['query_ids']
+    qk_list = prepared['query_k_list']
+    pool = [i for i in all_indices if qk_list[i] == int(selected_query_num)]
+
+    if exclude_overlap:
+        s = set(pretrain_idx)
+        pool = [i for i in pool if i not in s]
+    if len(pool) < k_folds:
+        raise ValueError("Not enough samples for K-fold after excluding overlap.")
+
+    y_all = np.array(prepared['true_cardinalities'], dtype=np.float64)
+    logy  = np.log1p(y_all[pool])
+    bin_ids  = _digitize_by_quantiles(logy, n_bins)
+    dens_ids = np.array([_parse_density_from_qid(qids[i]) for i in pool], dtype=int)
+
+    strata = {}
+    for li, gi in enumerate(pool):
+        key = (int(bin_ids[li]), int(dens_ids[li]))
+        strata.setdefault(key, []).append(gi)
+
+    folds = [{'train_idx': [], 'val_idx': []} for _ in range(k_folds)]
+    for _, idxs in strata.items():
+        idxs = rng.permutation(idxs).tolist()
+        base = len(idxs) // k_folds
+        rem  = len(idxs) % k_folds
+        sizes = [base + (1 if i < rem else 0) for i in range(k_folds)]
+        cur = 0
+        slices = []
+        for sz in sizes:
+            slices.append(idxs[cur:cur+sz]); cur += sz
+        for f in range(k_folds):
+            folds[f]['val_idx'].extend(slices[f])
+            folds[f]['train_idx'].extend([x for j, sl in enumerate(slices) if j != f for x in sl])
+    return {'pretrain_idx': pretrain_idx, 'folds': folds}
+
+def build_weighted_loader(dataset, indices, batch_size, seed, num_workers=0, pin_memory=False):
+    y = np.array([dataset.true_cardinalities[i] for i in indices], dtype=np.float64)
+    qids = [dataset.query_ids[i] for i in indices]
+    logy = np.log1p(y)
+    bin_ids  = _digitize_by_quantiles(logy, CONFIG["STRATA_NUM_BINS"])
+    dens_ids = np.array([_parse_density_from_qid(qid) for qid in qids], dtype=int)
+
+    from collections import Counter
+    layer_keys = [(int(b), int(d)) for b, d in zip(bin_ids, dens_ids)]
+    cnt = Counter(layer_keys)
+    weights = np.array([1.0 / cnt[k] for k in layer_keys], dtype=np.float32)
+    weights = torch.tensor(weights, dtype=torch.float32)
+
+    gen = torch.Generator().manual_seed(int(seed) + 999)
+    try:
+        sampler = WeightedRandomSampler(
+            weights, num_samples=len(indices),
+            replacement=CONFIG["SAMPLE_REPLACEMENT"],
+            generator=gen
+        )
+    except TypeError:
+        torch.manual_seed(int(seed) + 999)
+        sampler = WeightedRandomSampler(
+            weights, num_samples=len(indices),
+            replacement=CONFIG["SAMPLE_REPLACEMENT"]
+        )
+
+    loader = create_dataloader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        seed=seed,
+        sampler=sampler,
+        indices=indices,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    return loader
 
 # ---------------- 校准层 ----------------
 class OutputCalibrator(nn.Module):
@@ -762,44 +961,31 @@ def make_param_groups(model, base_lr, weight_decay, head_lr_mult=1.0, calibrator
     base_params = [p for p in model.parameters() if id(p) not in head_ids]
     return groups, base_params, head_params
 
+
+# ---------------- 训练/验证/测试 ----------------
 def train_one_phase(model, train_loader, val_loader, optimizer, scheduler,
                     epochs: int, patience: int, device: torch.device,
                     best_path: str = "best_model.pth",
                     calibrator: OutputCalibrator | None = None,
                     warmup_head_epochs: int = 0,
                     base_params=None):
-    """
-    使用 AveragedModel 做 EMA：
-    - 训练期间：每个 step 末尾 update EMA
-    - 验证：直接用 ema_model.module 验证（不再 clone/load）
-    - EarlyStopping：保存 ema_model.module（与验证一致）
-    - 训练结束：从 best_path 载入回 model（仍是“普通”模型），统一后续流程
-    """
-    # ---------- 新增：EMA ----------
-    ema_decay = 0.99
-    ema_model = AveragedModel(
-        model,
-        avg_fn=lambda avg, cur, n: ema_decay * avg + (1.0 - ema_decay) * cur
-    )
-    for p in ema_model.parameters():
-        p.requires_grad_(False)
-    # --------------------------------
-
     stopper = EarlyStopping(patience=patience, verbose=True, path=best_path)
+    ema_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    ema_decay = 0.99
 
     def _set_base_requires_grad(flag: bool):
         if base_params is None: return
         for p in base_params: p.requires_grad = flag
 
     for epoch in range(1, epochs + 1):
-        # 学习率 warmup（相对 base_lr）
+        # —— LR warmup ——
         if CONFIG.get('LR_WARMUP_EPOCHS', 0) and epoch <= CONFIG['LR_WARMUP_EPOCHS']:
             factor = float(epoch) / float(max(1, CONFIG['LR_WARMUP_EPOCHS']))
             for pg in optimizer.param_groups:
                 base_lr = pg.get('base_lr', pg['lr'])
                 pg['lr'] = base_lr * factor
 
-        # 阶段冻结策略
+        # —— 冻结策略（先训练 head，再全开，同时冻结 calibrator 调回偏置）——
         if epoch == 1 and warmup_head_epochs > 0:
             _set_base_requires_grad(False)
             print(f"[Warmup] Freeze backbone for first {warmup_head_epochs} epoch(s).")
@@ -809,6 +995,7 @@ def train_one_phase(model, train_loader, val_loader, optimizer, scheduler,
                 for p in calibrator.parameters(): p.requires_grad = False
             print("[Warmup] Unfreeze backbone & freeze calibrator.")
 
+        # —— Train ——
         model.train()
         if calibrator is not None: calibrator.train()
         running, start = 0.0, time.perf_counter()
@@ -817,85 +1004,123 @@ def train_one_phase(model, train_loader, val_loader, optimizer, scheduler,
             for data_graph_batch, query_batch, y in bar:
                 data_graph_batch, query_batch, y = move_batch_to_device(data_graph_batch, query_batch, y, device)
 
-                with amp.autocast(device_type='cuda', enabled=USE_AMP and (device.type == 'cuda')):
+                with amp.autocast(device_type=device.type, enabled=USE_AMP):
                     log1p_pred = model_forward_log1p_pred(model, data_graph_batch, query_batch)
                     if calibrator is not None:
                         log1p_pred = calibrator(log1p_pred)
 
-                    # === 联合损失 ===
-                    loss, parts = composite_loss(log1p_pred, y)
+                    # —— 三损失 —— 
+                    # (1) MSLE：直接在 log1p 空间里做 MSE
+                    target_log1p = torch.log1p(y.float().clamp_min(0.0))
+                    loss_msle = torch.mean((log1p_pred - target_log1p) ** 2)
+
+                    # (2) mean Q-Error
+                    qerr, pred, label = _qerror_tensor_from_log1p(log1p_pred, y, cap=CONFIG["QERR_CLIP_MAX"])
+                    loss_qerr = qerr.mean()
+
+                    # (3) Robust signed log10(qerr)：Huber + trimmed mean
+                    s_signed = _signed_log10_qerr(qerr, pred, label)
+                    loss_signed = _trimmed_mean_loss(_huber(s_signed, delta=CONFIG["LOG_HUBER_DELTA"]),
+                                                     CONFIG["TRIM_RATIO"])
+
+                    loss = (CONFIG["LAMBDA_MSLE"]        * loss_msle
+                          + CONFIG["LAMBDA_QERR_MEAN"]   * loss_qerr
+                          + CONFIG["LAMBDA_SIGNED_LOGQ"] * loss_signed)
+
+                    tail_weight = float(CONFIG.get("TAIL_QERR_PENALTY_WEIGHT", 0.0))
+                    tail_penalty = torch.zeros((), device=log1p_pred.device, dtype=log1p_pred.dtype)
+                    if tail_weight > 0:
+                        log10_q = torch.log10(qerr.clamp_min(1.0))
+                        thresh = float(CONFIG.get("TAIL_QERR_LOG10_THRESH", 1.0))
+                        excess = torch.clamp(log10_q - thresh, min=0.0)
+                        power = float(CONFIG.get("TAIL_QERR_PENALTY_POWER", 1.0))
+                        if power != 1.0:
+                            excess = excess.pow(power)
+                        tail_penalty = excess.mean()
+                        loss = loss + tail_weight * tail_penalty
+
+                    # calibrator 正则（若仍在学习）
+                    if calibrator is not None and any(p.requires_grad for p in calibrator.parameters()):
+                        loss = loss + CONFIG.get("CALIB_REG", 0.0) * (
+                            (calibrator.a - 1.0) ** 2 + (calibrator.b - 0.0) ** 2
+                        )
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+
+                # 防止梯度爆炸
+                clip_gradients(model, max_norm=10.0)
+
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 if calibrator is not None:
                     torch.nn.utils.clip_grad_norm_(calibrator.parameters(), 1.0)
                 optimizer.step()
 
-                # ---------- 新增：每 step 末尾更新 EMA ----------
-                ema_model.update_parameters(model)
-                # ------------------------------------------------
+                # EMA
+                with torch.no_grad():
+                    for k, v in model.state_dict().items():
+                        v_det = v.detach()
+                        if k not in ema_state:
+                            ema_state[k] = v_det.clone()
+                        else:
+                            ema_state[k].mul_(ema_decay).add_(v_det, alpha=1.0 - ema_decay)
 
                 running += float(loss.item())
                 postfix = dict(
                     loss=f"{running/(bar.n+1):.4f}",
-                    msle=f"{parts['msle']:.3f}",
-                    qerr=f"{parts['mean_qerr']:.3f}",
-                    huber=f"{parts['huber_logq']:.3f}"
+                    msle=f"{loss_msle.item():.3f}",
+                    qerr=f"{loss_qerr.item():.3f}",
+                    slogq=f"{loss_signed.item():.3f}",
                 )
-                if CONFIG.get("TAIL_QERR_PENALTY_WEIGHT", 0.0) > 0:
-                    postfix["tail"] = f"{parts.get('tail_penalty', 0.0):.3f}"
+                if tail_weight > 0:
+                    postfix["tail"] = f"{tail_penalty.item():.3f}"
                 bar.set_postfix(**postfix)
 
         print(f"Epoch {epoch}/{epochs}  TrainLoss={running/max(1,len(train_loader)):.6f}  time={time.perf_counter()-start:.1f}s")
 
-               # ===== Validation：以 Mean Q-Error 作为验证指标（使用 EMA 权重）=====
+        # ===== Validation (EMA, 指标=mean Q-Error) =====
         model.eval()
-        if calibrator is not None: 
-            calibrator.eval()
+        if calibrator is not None: calibrator.eval()
 
-        eval_model = ema_model.module     # 用 EMA 平均后的模型做验证
-        sum_qerr, n_samples = 0.0, 0
+        backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        model.load_state_dict(ema_state, strict=False)
 
-        with torch.no_grad(), tqdm(val_loader, desc="Validation(QErr)", unit="batch") as bar:
+        qerr_sum, n_cnt = 0.0, 0
+        abs_log10_list = []
+
+        with torch.no_grad(), tqdm(val_loader, desc="Validation", unit="batch") as bar:
             for dg_batch, q_batch, y in bar:
                 dg_batch, q_batch, y = move_batch_to_device(dg_batch, q_batch, y, device)
-                with amp.autocast(device_type='cuda', enabled=USE_AMP and (device.type == 'cuda')):
-                    log1p_pred = model_forward_log1p_pred(eval_model, dg_batch, q_batch)
-                    if calibrator is not None:
-                        log1p_pred = calibrator(log1p_pred)
-                    # 验证阶段不做裁剪：cap=None
-                    qerr, pred, label = _qerror_tensor_from_log1p(log1p_pred, y, cap=None)
-                    mean_q = qerr.mean()
+                log1p_pred = model_forward_log1p_pred(model, dg_batch, q_batch)
+                if calibrator is not None:
+                    log1p_pred = calibrator(log1p_pred)
+                qerr, pred, label = _qerror_tensor_from_log1p(log1p_pred, y, cap=None)  # 验证不裁剪
+                qerr_sum += qerr.sum().item()
+                n_cnt    += qerr.numel()
 
-                # 以样本数加权平均，避免最后一个小 batch 拉偏
-                bs = int(label.numel())
-                sum_qerr += float(mean_q.item()) * bs
-                n_samples += bs
+                s = _signed_log10_qerr(qerr, pred, label)
+                abs_log10_list.append(torch.abs(s).detach().cpu().numpy())
 
-                bar.set_postfix(mean_qerr=f"{(sum_qerr/max(1,n_samples)):.4f}")
+        val_mean_qerr = qerr_sum / max(1, n_cnt)
+        abs_log10_all = np.concatenate(abs_log10_list) if abs_log10_list else np.array([np.inf])
+        med_abs = float(np.median(abs_log10_all))
+        q3_abs  = float(np.percentile(abs_log10_all, 75))
 
-        val_qerr = sum_qerr / max(1, n_samples)
-        print(f"Val Mean Q-Error (EMA): {val_qerr:.6f}")
+        model.load_state_dict(backup, strict=False)
 
-        # 早停 & 学习率调度都用 Q-Error（越小越好）
-        stopper(val_qerr, _PackForSave(ema_model.module, calibrator))
+        print(f"Val mean Q-Error = {val_mean_qerr:.6f}  |  |log10Q| median={med_abs:.4f}  Q3={q3_abs:.4f}")
+
+        stopper(val_mean_qerr, _PackForSave(model, calibrator))
         if stopper.early_stop:
             print("Early stopping triggered.")
             break
-        scheduler.step(val_qerr)
+        scheduler.step(val_mean_qerr)
 
-
-    # 载入最佳（包含 calibrator）
-    device = next(model.parameters()).device
     state = torch.load(best_path, map_location=device)
     model_keys = {k.split("model.",1)[1]: v for k,v in state.items() if k.startswith("model.")}
-    calib_keys = {k.split("calib.",1)[1]: v for k,v in state.items() if k.startswith("calib.")}
-    model.load_state_dict(model_keys or state, strict=False)
-    if calibrator is not None and calib_keys:
-        calibrator.load_state_dict(calib_keys, strict=False)
-    return model, calibrator
 
+    model.load_state_dict(model_keys or state, strict=False)
+    return model, calibrator
 
 def test(model, loader, device: torch.device, out_path: str = "predictions_and_labels.txt",
          calibrator: OutputCalibrator | None = None):
@@ -905,125 +1130,107 @@ def test(model, loader, device: torch.device, out_path: str = "predictions_and_l
     model.eval()
     if calibrator is not None: calibrator.eval()
     total_mean_qerr, n = 0.0, 0
-    log10_q_list = []     # 收集 logQError
-    abs_log10_all = []    # 保留旧指标（可对比）
+    abs_log10_all = []
     start_t = time.perf_counter()
     with open(out_path, "w") as f, tqdm(loader, desc="Testing", unit="batch") as bar:
         f.write("Batch,Prediction,Label,QError\n")
         for dg_batch, q_batch, y in bar:
             dg_batch, q_batch, y = move_batch_to_device(dg_batch, q_batch, y, device)
-            with amp.autocast(device_type='cuda', enabled=USE_AMP and (device.type == 'cuda')):
+            with amp.autocast(device_type=device.type, enabled=USE_AMP):
                 log1p_pred = model_forward_log1p_pred(model, dg_batch, q_batch)
                 if calibrator is not None:
                     log1p_pred = calibrator(log1p_pred)
                 qerr, pred, label = _qerror_tensor_from_log1p(log1p_pred, y, cap=None)
             total_mean_qerr += qerr.sum().item()
             n += label.numel()
-
-            # 记录 logQError（无符号）与 |log10Q| 以便对比
-            l10 = torch.log10(qerr.clamp_min(1.0)).detach().cpu().numpy()
-            log10_q_list.append(l10)
-            abs_log10_all.append(np.abs(l10))
-
+            s = _signed_log10_qerr(qerr, pred, label)
+            abs_log10_all.append(torch.abs(s).detach().cpu().numpy())
             for idx, (p, l, e) in enumerate(zip(pred.tolist(), label.tolist(), qerr.tolist()), 1):
                 f.write(f"{idx},{p:.4f},{l:.4f},{e:.4f}\n")
-
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     total_time = time.perf_counter() - start_t
     avg_query_time = total_time / max(1, n)
     avg_q = total_mean_qerr / max(1, n)
-
-    # 统计 logQError 分位数
-    log10_q_all = np.concatenate(log10_q_list) if log10_q_list else np.array([np.inf])
-    p10 = float(np.percentile(log10_q_all, 10))
-    q1  = float(np.percentile(log10_q_all, 25))
-    med = float(np.percentile(log10_q_all, 50))
-    q3  = float(np.percentile(log10_q_all, 75))
-    p90 = float(np.percentile(log10_q_all, 90))
-    p95 = float(np.percentile(log10_q_all, 95))
-    mean_l10 = float(np.mean(log10_q_all))
-
-    # 旧的 |log10Q| IQR 统计（可留作对比）
     abs_log10_all = np.concatenate(abs_log10_all) if abs_log10_all else np.array([np.inf])
-    q1_abs, q3_abs = float(np.percentile(abs_log10_all, 25)), float(np.percentile(abs_log10_all, 75))
-    iqr_abs = q3_abs - q1_abs
-
+    val_med = float(np.median(abs_log10_all))
+    q1, q3 = float(np.percentile(abs_log10_all, 25)), float(np.percentile(abs_log10_all, 75))
+    val_iqr = q3 - q1
     print(
-        f"Test Mean Q-Error {avg_q:.6f} | "
-        f"logQError stats -> mean={mean_l10:.4f}  p10={p10:.4f}  Q1={q1:.4f}  median={med:.4f}  Q3={q3:.4f}  p90={p90:.4f}  p95={p95:.4f} | "
-        f"Avg Query Time = {avg_query_time:.6f} s"
+        f"Test Mean Q-Error {avg_q:.6f} | |log10Q| median={val_med:.4f} "
+        f"Q1={q1:.4f}  Q3={q3:.4f}  IQR={val_iqr:.4f} | Avg Query Time = {avg_query_time:.6f} s"
     )
     with open(out_path, "a") as f:
-        f.write("# logQError_percentiles\n")
-        f.write(f"# mean={mean_l10:.6f}, p10={p10:.6f}, q1={q1:.6f}, median={med:.6f}, q3={q3:.6f}, p90={p90:.6f}, p95={p95:.6f}\n")
         f.write(f"# total_queries: {n}\n")
         f.write(f"# total_test_time_sec: {total_time:.6f}\n")
         f.write(f"# average_query_time_sec: {avg_query_time:.6f}\n")
-    return avg_q, med, q3, iqr_abs
-
-# ---------------- 高 QErr 样本识别 ----------------
-def collect_qerror_for_indices(
-    model: GraphCardinalityEstimatorMultiSubgraph,
-    dataset,
-    indices: list[int],
-    device: torch.device,
-    *,
-    calibrator: OutputCalibrator | None = None,
-    batch_size: int = 32,
-):
-    """返回 {dataset_idx: qerr}，用于后续加权采样。"""
-    if not indices:
-        return {}
-
-    loader = create_dataloader(
-        dataset,
-        batch_size,
-        indices=indices,
-        shuffle=False,
-        seed=0,
-        pin_memory=False,
-    )
-
-    prev_training = model.training
-    model.eval()
-    prev_calib_training = None
-    if calibrator is not None:
-        prev_calib_training = calibrator.training
-        calibrator.eval()
-
-    stats = {}
-    offset = 0
-    with torch.no_grad():
-        for data_graph_batch, query_batch, y in loader:
-            cur_idx = indices[offset: offset + int(y.numel())]
-            offset += int(y.numel())
-            data_graph_batch, query_batch, y = move_batch_to_device(
-                data_graph_batch, query_batch, y, device
-            )
-            log1p_pred = model_forward_log1p_pred(model, data_graph_batch, query_batch)
-            if calibrator is not None:
-                log1p_pred = calibrator(log1p_pred)
-            qerr, _, _ = _qerror_tensor_from_log1p(log1p_pred, y, cap=None)
-            for idx, qe in zip(cur_idx, qerr.detach().cpu().tolist()):
-                stats[int(idx)] = float(qe)
-
-    if prev_training:
-        model.train()
-    if calibrator is not None and prev_calib_training:
-        calibrator.train()
-
-    return stats
+    return avg_q, val_med, q3, val_iqr
 
 # ---------------- 主流程 ----------------
 def main():
-    global CONFIG, GLOBAL_NUM_VERTICES, GLOBAL_NUM_LABELS
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML config file overriding defaults")
+    parser.add_argument("--enable-shortcut", dest="enable_shortcut", action="store_true",
+                        help="Force enable embed shortcut gating")
+    parser.add_argument("--disable-shortcut", dest="enable_shortcut", action="store_false",
+                        help="Disable embed shortcut gating")
+    parser.add_argument("--shortcut-init", type=float, default=None,
+                        help="Initial logit for embed shortcut gate")
+    parser.add_argument("--enable-multi-scale", dest="enable_multi_scale", action="store_true",
+                        help="Enable multi-scale pooling wrapper")
+    parser.add_argument("--disable-multi-scale", dest="enable_multi_scale", action="store_false",
+                        help="Disable multi-scale pooling wrapper")
+    parser.add_argument("--multi-scale-fusion", type=str, choices=["gate", "concat"], default=None,
+                        help="Fusion strategy between pooling branches")
+    parser.add_argument("--multi-scale-dropout", type=float, default=None,
+                        help="Dropout applied on fused multi-scale features")
+    parser.add_argument("--multi-scale-gate-init", type=float, default=None,
+                        help="Initial logit for multi-scale fusion gate")
+    parser.add_argument("--multi-scale-attn-hidden", type=int, default=None,
+                        help="Hidden size for attention pooling within multi-scale module")
+    parser.add_argument("--enable-cross-attn", dest="enable_cross_attn", action="store_true",
+                        help="Enable the lightweight cross-attention head between query and memory tokens")
+    parser.add_argument("--disable-cross-attn", dest="enable_cross_attn", action="store_false",
+                        help="Disable the lightweight cross-attention head")
+    parser.add_argument("--cross-attn-heads", type=int, default=None,
+                        help="Number of heads used by the lightweight cross-attention")
+    parser.add_argument("--cross-attn-dropout", type=float, default=None,
+                        help="Dropout applied inside the lightweight cross-attention")
+    parser.add_argument("--cross-ffn-hidden", type=int, default=None,
+                        help="Hidden size of the feed-forward fusion layer after cross-attention")
+    parser.add_argument("--enable-mem-pos", dest="enable_mem_pos", action="store_true",
+                        help="Inject learnable positional encodings into memory tokens")
+    parser.add_argument("--disable-mem-pos", dest="enable_mem_pos", action="store_false",
+                        help="Disable positional encodings for memory tokens")
+    parser.add_argument(
+        "--variant", type=str, default=None,
+        help="选择消融：BASE | NO_GIN | NO_ATTENTION | NO_GIN_NO_ATTENTION （兼容：NO_ENCODER | NO_DECODER）"
+    )
+    parser.add_argument(
+        "--selected-query-num",
+        type=int,
+        default=None,
+        help="Override CONFIG['SELECTED_QUERY_NUM'] (默认 24，例如 4、8、12 等)"
+    )
+    parser.set_defaults(
+        enable_shortcut=None,
+        enable_multi_scale=None,
+        enable_cross_attn=None,
+        enable_mem_pos=None,
+    )
+    args = parser.parse_args()
+    _apply_cli_overrides(args)
+    if args.variant:
+        CONFIG["MODEL_VARIANT"] = args.variant
     CONFIG.update(_bind_output_paths_to_selected_num(_apply_dataset(CONFIG)))
+    global GLOBAL_NUM_VERTICES, GLOBAL_NUM_LABELS
     C = CONFIG
     torch.manual_seed(C["SEED"]); np.random.seed(C["SEED"])
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(C["SEED"])
     device = torch.device("cuda:0" if (C["DEVICE"] == "cuda" and torch.cuda.is_available()) else "cpu")
-    print("Using", device)
+    print("Using", device,
+          "| Variant =", C["MODEL_VARIANT"],
+          "| SELECTED_QUERY_NUM =", C["SELECTED_QUERY_NUM"])
 
     query_dir = resolve_query_dir(C["QUERY_ROOT"], C["QUERY_NUM_DIR"], C["QUERY_DIR"])
     if not os.path.exists(C["PREPARED_OUT"]):
@@ -1044,7 +1251,7 @@ def main():
     num_subgraphs = len(prepared['pyg_data_graphs'][0])
     print(f"[Info] num_subgraphs = {num_subgraphs}")
 
-    # 统计 ID / label 范围（用于后续 embedding 扩容）
+    # —— 统计范围用于 embedding 扩容 —— 
     vmins, vmaxs = [], []
     for g in prepared['pyg_data_graphs'][0]:
         if 'vertex_ids' in g and g['vertex_ids'].numel() > 0:
@@ -1135,20 +1342,16 @@ def main():
     model = build_model(device, data_graph, num_subgraphs=num_subgraphs)
     _maybe_resize_embeddings(model, GLOBAL_NUM_VERTICES, GLOBAL_NUM_LABELS)
 
-    # 若存在已完成的预训练权重，直接加载并跳过 Stage 1（连同 calibrator）
+    # 若存在已完成的预训练权重，直接加载并跳过 Stage 1
     if os.path.exists(C["BEST_PRE_PATH"]):
         print(f"[Info] Found existing best pretrain weights: {C['BEST_PRE_PATH']} (will load & skip Stage 1)")
         state_pre = torch.load(C["BEST_PRE_PATH"], map_location=device)
         model_keys = {k.split("model.",1)[1]: v for k,v in state_pre.items() if k.startswith("model.")}
-        calib_keys = {k.split("calib.",1)[1]: v for k,v in state_pre.items() if k.startswith("calib.")}
         if not model_keys: model_keys = state_pre
         _resize_to_fit_checkpoint(model, model_keys)
         model.load_state_dict(model_keys, strict=False)
         calibrator_pre = OutputCalibrator() if CONFIG["USE_CALIBRATOR"] else None
-        if calibrator_pre is not None and calib_keys:
-            calibrator_pre.load_state_dict(calib_keys, strict=False)
     else:
-        # 设定 head.bias 为 log1p(y) 的均值或中位
         y_pre_train = np.array([prepared['true_cardinalities'][i] for i in pre_tr], dtype=np.float64)
         mu_pre = float((np.median if CONFIG["USE_MEDIAN_BIAS"] else np.mean)(np.log1p(y_pre_train))) if y_pre_train.size else 0.0
         set_head_bias_to_mu(model, mu_pre)
@@ -1162,7 +1365,7 @@ def main():
         sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min",
                                                          patience=max(1, CONFIG["PATIENCE"] // 2), factor=0.5)
 
-        print("\n========== Stage 1: Pretrain (composite loss) ==========")
+        print("\n========== Stage 1: Pretrain (MSLE + meanQ + robust signed log10Q, 20% of ALL queries) ==========")
         model, calibrator_pre = train_one_phase(
             model, pre_train_dl, pre_val_dl, opt, sch,
             epochs=CONFIG["EPOCHS_PRE"], patience=CONFIG["PATIENCE"], device=device,
@@ -1173,8 +1376,8 @@ def main():
         torch.save(_PackForSave(model, calibrator_pre).state_dict(), CONFIG["PRETRAIN_WEIGHTS"])
         print(f"保存预训练权重 -> {CONFIG['PRETRAIN_WEIGHTS']}")
 
-    # ====== K 折微调（只用 SELECTED_QUERY_NUM） ======
-    print("\n========== Stage 2: K-Fold Fine-tuning (composite loss) ==========")
+    # ====== K 折微调（train 内切 inner-val；fold 的 val_idx 仅做测试） ======
+    print("\n========== Stage 2: K-Fold Fine-tuning (only SELECTED_QUERY_NUM) ==========")
     fold_qerrs, fold_box_q3, fold_box_med = [], [], []
 
     def _print_fold_stats(name, y_list):
@@ -1187,7 +1390,7 @@ def main():
     INNER_VAL_RATIO = 0.10  # 9:1 切 inner-val；至少保证 1 个样本
 
     for i, fold in enumerate(splits['folds'], 1):
-        tr_idx_main, test_idx = fold['train_idx'], fold['val_idx']  # test_idx 只用于最终测试
+        tr_idx_main, test_idx = fold['train_idx'], fold['val_idx']
         print(f"\n---- Fold {i}/{len(splits['folds'])}  train(main)={len(tr_idx_main)}  test={len(test_idx)} ----")
         _print_fold_stats("FoldTrainY(main)", [prepared['true_cardinalities'][j] for j in tr_idx_main])
         _print_fold_stats("FoldTestY",        [prepared['true_cardinalities'][j] for j in test_idx])
@@ -1199,6 +1402,16 @@ def main():
         inner_val_idx   = tr_shuf[:cut]
         inner_train_idx = tr_shuf[cut:]
         print(f"[Fold {i}] inner-train={len(inner_train_idx)}  inner-val={len(inner_val_idx)}")
+
+        # 训练加载器：仅 inner-train
+        if CONFIG["USE_WEIGHTED_SAMPLER"]:
+            ft_train_dl = build_weighted_loader(
+                dataset, inner_train_idx, batch_size=CONFIG["BATCH_SIZE"],
+                seed=C["SEED"], num_workers=CONFIG["NUM_WORKERS"], pin_memory=False
+            )
+        else:
+            ft_train_dl = create_dataloader(dataset, CONFIG["BATCH_SIZE"], indices=inner_train_idx,
+                                            shuffle=True, seed=C["SEED"], pin_memory=False)
 
         # 早停验证加载器：inner-val
         ft_inner_val_dl = create_dataloader(dataset, CONFIG["BATCH_SIZE"], indices=inner_val_idx,
@@ -1212,83 +1425,19 @@ def main():
         model_k = build_model(device, load_graph_from_file(CONFIG["DATA_GRAPH"]), num_subgraphs=num_subgraphs)
         _maybe_resize_embeddings(model_k, GLOBAL_NUM_VERTICES, GLOBAL_NUM_LABELS)
 
-        # 从预训练权重加载（包含 calibrator 作为初始化）
         pre_path = CONFIG["BEST_PRE_PATH"] if os.path.exists(CONFIG["BEST_PRE_PATH"]) else CONFIG["PRETRAIN_WEIGHTS"]
-        calibrator_k = OutputCalibrator() if CONFIG["USE_CALIBRATOR"] else None
         if os.path.exists(pre_path):
             state_pre = torch.load(pre_path, map_location=device)
             model_keys = {k.split("model.",1)[1]: v for k,v in state_pre.items() if k.startswith("model.")}
-            calib_keys = {k.split("calib.",1)[1]: v for k,v in state_pre.items() if k.startswith("calib.")}
             if not model_keys: model_keys = state_pre
             _resize_to_fit_checkpoint(model_k, model_keys)
             model_k.load_state_dict(model_keys, strict=False)
-            if calibrator_k is not None and calib_keys:
-                calibrator_k.load_state_dict(calib_keys, strict=False)
-
-        tail_multipliers = None
-        if (
-            CONFIG.get("ENABLE_TAIL_SAMPLE_REWEIGHT", True)
-            and CONFIG.get("USE_WEIGHTED_SAMPLER", True)
-            and inner_train_idx
-        ):
-            tail_pct = float(CONFIG.get("TAIL_SAMPLE_REWEIGHT_PCT", 0.0))
-            tail_factor = float(CONFIG.get("TAIL_SAMPLE_REWEIGHT_FACTOR", 1.0))
-            tail_min_qerr = float(CONFIG.get("TAIL_SAMPLE_REWEIGHT_MIN_QERR", 1.0))
-            if tail_pct > 0 and tail_factor > 1.0:
-                if tail_pct > 1.0:
-                    tail_pct = tail_pct / 100.0
-                print(f"[Fold {i}] 收集预估 Q-Error 以识别尾部样本 …")
-                qerr_map = collect_qerror_for_indices(
-                    model_k,
-                    dataset,
-                    inner_train_idx,
-                    device,
-                    calibrator=calibrator_k,
-                    batch_size=CONFIG["BATCH_SIZE"],
-                )
-                if qerr_map:
-                    qerr_vals = np.array([qerr_map[idx] for idx in inner_train_idx], dtype=np.float64)
-                    perc = max(0.0, min(100.0, 100.0 * (1.0 - tail_pct)))
-                    tail_threshold = float(np.percentile(qerr_vals, perc))
-                    cutoff = max(tail_min_qerr, tail_threshold)
-                    tail_indices = [idx for idx in inner_train_idx if qerr_map[idx] >= cutoff]
-                    if tail_indices:
-                        tail_multipliers = {idx: tail_factor for idx in tail_indices}
-                        print(
-                            f"[Fold {i}] Tail boost: {len(tail_indices)}/{len(inner_train_idx)} samples "
-                            f">= {cutoff:.3f} (factor={tail_factor})"
-                        )
-                    else:
-                        print(f"[Fold {i}] 未找到满足 cutoff={cutoff:.3f} 的高 Q-Error 样本。")
-
-        # 训练加载器：仅 inner-train（带高 QErr 重加权）
-        if CONFIG["USE_WEIGHTED_SAMPLER"]:
-            ft_train_dl = build_weighted_loader(
-                dataset,
-                inner_train_idx,
-                batch_size=CONFIG["BATCH_SIZE"],
-                create_dl_fn=create_dataloader,
-                seed=C["SEED"],
-                num_workers=CONFIG["NUM_WORKERS"],
-                pin_memory=False,
-                per_index_multipliers=tail_multipliers,
-            )
-        else:
-            if tail_multipliers:
-                print("[Warn] Tail reweighting需要 USE_WEIGHTED_SAMPLER=True；当前将忽略。")
-            ft_train_dl = create_dataloader(
-                dataset,
-                CONFIG["BATCH_SIZE"],
-                indices=inner_train_idx,
-                shuffle=True,
-                seed=C["SEED"],
-                pin_memory=False,
-            )
 
         y_fold_train = np.array([prepared['true_cardinalities'][j] for j in inner_train_idx], dtype=np.float64)
         # mu_fold = float((np.median if CONFIG["USE_MEDIAN_BIAS"] else np.mean)(np.log1p(y_fold_train))) if y_fold_train.size else 0.0
         # set_head_bias_to_mu(model_k, mu_fold)
 
+        calibrator_k = OutputCalibrator() if CONFIG["USE_CALIBRATOR"] else None
         groups, base_params_k, _ = make_param_groups(
             model_k, CONFIG["LR"], CONFIG["WEIGHT_DECAY"], head_lr_mult=CONFIG["HEAD_LR_MULT"],
             calibrator=calibrator_k, calib_lr_mult=CONFIG["CALIB_LR_MULT"]
@@ -1298,7 +1447,6 @@ def main():
                                                            patience=CONFIG["PATIENCE"], factor=0.5)
 
         best_fold_path = CONFIG["BEST_FOLD_PATH_TPL"].format(fold=i)
-        # 训练时只用 inner-val 做早停
         model_k, calibrator_k = train_one_phase(
             model_k, ft_train_dl, ft_inner_val_dl, opt_k, sch_k,
             epochs=CONFIG["EPOCHS_FT"], patience=CONFIG["PATIENCE"], device=device,
@@ -1308,7 +1456,7 @@ def main():
             base_params=base_params_k
         )
 
-        # 仅在该折的真正测试集上评估（不 clip）
+        # ★ 仅在该折的真正测试集上评估（不 clip）
         pred_txt = CONFIG["PRED_TXT_TPL"].format(fold=i)
         avg_q, med_log, q3_log, iqr_log = test(model_k, ft_test_dl, device, out_path=pred_txt, calibrator=calibrator_k)
         fold_qerrs.append(avg_q); fold_box_med.append(med_log); fold_box_q3.append(q3_log)
@@ -1316,13 +1464,11 @@ def main():
     if fold_qerrs:
         print("\n========== K-Fold Summary ==========")
         for i, (q, medl, q3l) in enumerate(zip(fold_qerrs, fold_box_med, fold_box_q3), 1):
-            print(f"Fold {i}: Mean Q-Err = {q:.6f} | logQError median={medl:.4f} Q3={q3l:.4f}")
+            print(f"Fold {i}: Mean Q-Err = {q:.6f} | |log10Q| median={medl:.4f} Q3={q3l:.4f}")
         print(f"Overall mean Q-Error = {np.mean(fold_qerrs):.6f}")
-        print(f"Overall logQError median = {np.mean(fold_box_med):.4f}  Q3 = {np.mean(fold_box_q3):.4f}")
+        print(f"Overall |log10Q| median = {np.mean(fold_box_med):.4f}  Q3 = {np.mean(fold_box_q3):.4f}")
 
     print("\nAll done.")
 
-if __name__ == "__main__":
-    parsed_args = _parse_args()
-    _apply_cli_overrides(parsed_args)
+if __name__ == "__main__": 
     main()

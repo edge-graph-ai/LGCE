@@ -32,6 +32,7 @@ checkpoints/
 *.ckpt
 *.pth
 *.h5
+*.pt
 
 # Model weights
 *.weights
@@ -89,7 +90,7 @@ checkpoints/
 *.cache
 *.pytest_cache/
 tests/__pycache__/
-
+tests/
 *ablation*/
 compare/
 data/
@@ -101,4 +102,3 @@ data/
 
 *.pdf
 *.svg
-*.sh

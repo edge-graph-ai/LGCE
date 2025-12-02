@@ -14,27 +14,19 @@ __all__ = [
 
 # ---------- small helpers (pure) ----------
 def _parse_density_from_qid(qid: str) -> int:
-    """
-    简单从 query_id 中判断密度标签：
-      - 包含 'dense' -> 1
-      - 包含 'sparse' -> 0
-      - 否则 -> -1（未知）
-    """
+
     low = (qid or "").lower()
     if "dense" in low:  return 1
     if "sparse" in low: return 0
     return -1
 
 def _digitize_by_quantiles(values: np.ndarray, n_bins: int) -> np.ndarray:
-    """
-    按分位数切分到 n_bins 个桶，返回每个样本所属桶 id（0..n_bins-1）
-    为避免切分边界完全相等导致的退化，做极小扰动。
-    """
+
     if values.size == 0:
         return np.zeros(0, dtype=int)
     qs = np.linspace(0, 1, n_bins + 1)
     cuts = np.quantile(values, qs)
-    # 去重/非降处理
+
     for i in range(1, len(cuts)):
         if cuts[i] <= cuts[i-1]:
             cuts[i] = cuts[i-1] + 1e-12
@@ -52,15 +44,7 @@ def make_splits_indices_stratified(
     exclude_overlap: bool,
     n_bins: int,
 ):
-    """
-    分层划分：
-      1) 从所有样本中随机抽 pretrain_ratio 做预训练集合
-      2) 在 query_k_list == selected_query_num 的集合上做 K 折，
-         分层依据 = log1p(y) 的分位桶 + 稠密/稀疏标签
-      3) 可选地从 K 折池子中剔除与预训练集重叠的索引
-    返回：
-      {'pretrain_idx': [...], 'folds': [{'train_idx': [...], 'val_idx': [...]}, ...]}
-    """
+
     rng = np.random.RandomState(seed)
     qids = prepared['query_ids']
     qk_list = prepared['query_k_list']
@@ -69,17 +53,17 @@ def make_splits_indices_stratified(
     n = len(qids)
     all_indices = np.arange(n)
 
-    # 1) 预训练随机子集
+
     pre_n = max(1, int(round(pretrain_ratio * n)))
     pretrain_idx = rng.permutation(all_indices)[:pre_n].tolist()
 
-    # 2) K 折候选池：筛选出 k == selected_query_num
+
     pool = [i for i in all_indices if int(qk_list[i]) == int(selected_query_num)]
     if exclude_overlap:
         s = set(pretrain_idx)
         pool = [i for i in pool if i not in s]
 
-    # 样本太少时，放宽限制或调整折数
+
     if len(pool) < k_folds:
         if exclude_overlap:
             pool = [i for i in all_indices if int(qk_list[i]) == int(selected_query_num)]
@@ -88,12 +72,12 @@ def make_splits_indices_stratified(
             if k_folds <= 1:
                 raise ValueError("Not enough samples to perform K-fold even after relaxing constraints.")
 
-    # 3) 分层依据
+
     logy  = np.log1p(y_all[pool])
     bin_ids  = _digitize_by_quantiles(logy, n_bins)
     dens_ids = np.array([_parse_density_from_qid(qids[i]) for i in pool], dtype=int)
 
-    # 4) 各层内部 round-robin 分配到 K 折
+
     strata = {}
     for li, gi in enumerate(pool):
         key = (int(bin_ids[li]), int(dens_ids[li]))
@@ -128,13 +112,7 @@ def build_weighted_loader(
     pin_memory: bool = False,
     per_index_multipliers: Optional[Mapping[int, float]] = None,
 ):
-    """
-    基于 (log1p(y) 分桶 × 稀疏/稠密标签) 的分层加权采样。
-    可选 per_index_multipliers 允许为特定样本额外调整采样权重，聚焦尾部难例。
-    不依赖 CONFIG / create_dataloader；需要外部传入 create_dl_fn(dataset, **kwargs)。
 
-    返回：由 create_dl_fn 创建的 DataLoader。
-    """
     if create_dl_fn is None:
         raise RuntimeError("build_weighted_loader: create_dl_fn must be provided.")
 

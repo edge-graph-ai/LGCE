@@ -4,12 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class TokenAttentionPool(nn.Module):
-    """
-    对一组 token（节点表示）进行注意力加权池化：
-      input:  X  [N, D] 或 [B, N, D]
-      output: y  [D]     或 [B, D]
-    权重 = softmax( W2(GELU(W1 * x)) )，可学习到对关键节点的偏置。
-    """
+
     def __init__(self, hidden_dim: int, attn_hidden: int = 64, dropout: float = 0.1):
         super().__init__()
         self.proj1 = nn.Linear(hidden_dim, attn_hidden)
@@ -17,7 +12,7 @@ class TokenAttentionPool(nn.Module):
         self.act   = nn.GELU()
         self.drop  = nn.Dropout(dropout)
 
-        # 小初始化，避免初期过于尖锐
+
         nn.init.xavier_uniform_(self.proj1.weight)
         nn.init.zeros_(self.proj1.bias)
         nn.init.xavier_uniform_(self.proj2.weight, gain=0.5)
@@ -25,7 +20,7 @@ class TokenAttentionPool(nn.Module):
 
     def forward(self, x):
         if x.numel() == 0:
-            # 空输入：返回零向量
+
             if x.dim() == 2:
                 return torch.zeros(1, x.shape[-1], device=x.device, dtype=x.dtype)
             else:

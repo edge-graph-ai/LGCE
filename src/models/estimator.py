@@ -10,7 +10,7 @@ def _maybe_log1p_degree(deg_tensor):
     if deg_tensor is None or not torch.is_tensor(deg_tensor):
         return None
     deg = deg_tensor.float()
-    deg = torch.clamp(deg, min=0.0, max=1e6)  # ★ 限制最大值，防止 Inf
+    deg = torch.clamp(deg, min=0.0, max=1e6) 
     deg = torch.where(torch.isfinite(deg), deg, torch.tensor(1.0, device=deg.device))
     return torch.log1p(deg)
 
@@ -30,8 +30,8 @@ class _Embed(nn.Module):
         nn.init.xavier_uniform_(self.label_emb.weight)
         nn.init.xavier_uniform_(self.deg_proj.weight)
         nn.init.zeros_(self.deg_proj.bias)
-        self.vertex_emb  = self.id_emb      # 让 _maybe_resize_embeddings() 能发现顶点 embedding
-        self.label_embed = self.label_emb   # 两个名字都能被发现（可选，但推荐）
+        self.vertex_emb  = self.id_emb      
+        self.label_embed = self.label_emb   
     def _safe_gather(self, emb: nn.Embedding, idx: torch.Tensor):
         return emb(idx)
 
@@ -109,11 +109,11 @@ class GraphCardinalityEstimatorMultiSubgraph(nn.Module):
             fusion_dropout=ms_dropout,
         )
 
-        # ★ 新增：池化温度（正值）。softplus 保证 >0，初值≈1.1，让注意力更“尖锐”
+        
         self._pool_scale_data  = nn.Parameter(torch.tensor(0.2))
         self._pool_scale_query = nn.Parameter(torch.tensor(0.2))
 
-        # ★ 嵌入捷径门控
+
         def _make_shortcut_layer():
             if int(gnn_in_ch) == int(gnn_out_ch):
                 return nn.Identity()
@@ -133,7 +133,7 @@ class GraphCardinalityEstimatorMultiSubgraph(nn.Module):
             self.embed_shortcut_alpha_data = None
             self.embed_shortcut_alpha_query = None
 
-        # 原有投影（保留，兼容你的外部 fallback 调用）
+        
         self.project = nn.Sequential(
             nn.LayerNorm(gnn_out_ch),
             nn.GELU(),
@@ -143,7 +143,7 @@ class GraphCardinalityEstimatorMultiSubgraph(nn.Module):
         nn.init.xavier_uniform_(self.project[2].weight)
         nn.init.zeros_(self.project[2].bias)
 
-        # ★ Transformer：改为 pre-norm（norm_first=True），更稳定不易塌到常数
+       
         enc_layer = nn.TransformerEncoderLayer(
             d_model=D, nhead=transformer_heads, dim_feedforward=transformer_ffn_dim,
             batch_first=True, dropout=dropout, activation="gelu", norm_first=True
@@ -161,7 +161,7 @@ class GraphCardinalityEstimatorMultiSubgraph(nn.Module):
 
         self.use_memory_positional_encoding = bool(use_memory_positional_encoding)
         if self.use_memory_positional_encoding:
-            # +1 以防止序列长度刚好等于 num_subgraphs 时越界
+
             self.mem_pos_embedding = nn.Embedding(max(1, num_subgraphs + 1), D)
             nn.init.normal_(self.mem_pos_embedding.weight, std=0.02)
             self.register_buffer(
@@ -193,7 +193,7 @@ class GraphCardinalityEstimatorMultiSubgraph(nn.Module):
         )
         self.cross_ffn_norm = nn.LayerNorm(D)
 
-        # ★ Head：移除首个 LayerNorm，保留可分性；最后一层仍是 Linear，兼容 set_head_bias_to_mu()
+        
         self.head = nn.Sequential(
             nn.Linear(D, 128),
             nn.GELU(),
@@ -202,7 +202,7 @@ class GraphCardinalityEstimatorMultiSubgraph(nn.Module):
         nn.init.xavier_uniform_(self.head[0].weight); nn.init.zeros_(self.head[0].bias)
         nn.init.xavier_uniform_(self.head[-1].weight); nn.init.zeros_(self.head[-1].bias)
 
-        # 这些属性用于外部推断尺寸（可选）
+       
         self.num_vertices = num_vertices
         self.num_labels   = num_labels
 
@@ -213,7 +213,7 @@ class GraphCardinalityEstimatorMultiSubgraph(nn.Module):
             shortcut = self.shortcut_proj_data(embed_x)
             gate = self._shortcut_gate_act(self.embed_shortcut_alpha_data)
             x = gate * x + (1.0 - gate) * shortcut
-        # ★ 池化前做可学习缩放，促使注意力分布更尖锐
+        
         x = x * F.softplus(self._pool_scale_data)
         pooled = self.pool_data(x)                               # [1,C]
         return self.project(pooled)                              # [1,D]
@@ -273,8 +273,8 @@ class GraphCardinalityEstimatorMultiSubgraph(nn.Module):
         ff = self.cross_ffn_norm(ff + x)
         return ff
 
-    def load_state_dict(self, state_dict, strict: bool = True):  # noqa: D401 - docstring inherited
-        # 兼容旧 checkpoint：忽略 TransformerDecoder 的权重
+    def load_state_dict(self, state_dict, strict: bool = True): 
+       
         if not isinstance(state_dict, dict):
             incompatible = super().load_state_dict(state_dict, strict=strict)
             return incompatible

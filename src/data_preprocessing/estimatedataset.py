@@ -4,16 +4,13 @@ from torch.utils.data import Dataset
 
 class EstimateDataset(Dataset):
     """
-    一个轻量的数据集：为每个查询图配对：
-      - 同一份数据子图列表（PyG Data）
-      - 它的真实基数
-      - 它的 query_id（例如 'query_dense_12_165'），便于做分层/过滤
+
 
     Args:
-        data_pygs: List[List[PyG Data]]  —— 数据图的子图列表；通常所有样本共享同一份
-        query_pygs: List[PyG Data]       —— 每个查询图各一个
-        true_cardinalities: List[int]    —— 与 query_pygs 对齐的一一对应标签
-        query_ids: Optional[List[str]]   —— 与 query_pygs 同长；若不给就用 q_{i}
+        data_pygs: List[List[PyG Data]]   
+        query_pygs: List[PyG Data]        
+        true_cardinalities: List[int]    
+        query_ids: Optional[List[str]]   
     """
     def __init__(self, data_pygs, query_pygs, true_cardinalities, query_ids=None):
         assert len(query_pygs) == len(true_cardinalities), \
@@ -32,7 +29,7 @@ class EstimateDataset(Dataset):
         q = self.query_pygs[idx]
         y = int(self.true_cardinalities[idx])
         sample = ({
-            'data_graph': self.data_pygs,     # 共享一份子图列表
+            'data_graph': self.data_pygs,     
             'query_graph': q,
             'query_id': self.query_ids[idx],
         }, torch.tensor(y, dtype=torch.long))
