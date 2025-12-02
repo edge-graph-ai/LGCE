@@ -1,6 +1,7 @@
 """Command-line entrypoint orchestrating training, ablations, and evaluation."""
 import argparse
 import os
+import sys
 from pathlib import Path
 THIS_FILE = Path(__file__).resolve()
 PROJECT_ROOT = THIS_FILE.parents[1]
