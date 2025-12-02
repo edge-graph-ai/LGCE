@@ -44,7 +44,7 @@ def _extract_query_k(qid: str) -> int:
     return int(m.group(1))
 
 
-# ======== 核心 I/O 接口 ========
+# ======== Core I/O interfaces ========
 def load_prepared_pyg(prepared_pt_path: str) -> Dict[str, Any]:
 
     pack = torch.load(prepared_pt_path, map_location="cpu", weights_only=False)

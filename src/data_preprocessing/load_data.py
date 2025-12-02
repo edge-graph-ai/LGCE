@@ -147,17 +147,17 @@ def load_true_cardinalities_aligned(matches_path, query_ids):
         extra   = [k for k in name_to_cnt.keys() if k not in set(query_ids)]
         if missing:
             raise ValueError(
-                f"在 {matches_path} 未找到这些查询的 #Matches：{missing[:5]}"
+                f"Did not find #Matches for these queries in {matches_path}: {missing[:5]}"
                 + (" ..." if len(missing) > 5 else "")
             )
         if extra:
-            print(f"[Warn] {matches_path} 有额外项（已忽略）：{extra[:5]}" + (" ..." if len(extra) > 5 else ""))
+            print(f"[Warn] Extra entries in {matches_path} (ignored): {extra[:5]}" + (" ..." if len(extra) > 5 else ""))
         return [name_to_cnt[qid] for qid in query_ids]
 
     if len(counts_seq) != len(query_ids):
         raise ValueError(
-            f"{matches_path} 仅包含顺序数值且数量不等：counts={len(counts_seq)} vs queries={len(query_ids)}。\n"
-            f"请确保文件里包含查询名，或保证两者顺序完全一致。"
+            f"{matches_path} only contains sequential counts and the quantity differs: counts={len(counts_seq)} vs queries={len(query_ids)}.\n"
+            f"Ensure the file lists query names, or the order matches the filename-sorted queries."
         )
-    print("[Warn] 基数文件没有包含查询名称，按行顺序对齐 —— 请确保其生成顺序与按文件名排序后的查询一致！")
+    print("[Warn] Cardinality file lacks query names; aligning by line order — ensure it matches filename order!")
     return counts_seq
