@@ -28,6 +28,7 @@ CONFIG: Dict[str, Any] = dict(
     EPOCHS_FT=50,
     PATIENCE=10,
     PRETRAIN_RATIO=0.20,
+    PRETRAIN_VAL_RATIO=0.10,
     K_FOLDS=5,
     EXCLUDE_OVERLAP=True,
     NUM_WORKERS=0,

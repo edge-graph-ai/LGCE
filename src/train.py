@@ -175,8 +175,18 @@ def main():
                                             n_bins=CONFIG["STRATA_NUM_BINS"])
     _preview_splits(prepared, splits)
 
-    pre_tr = splits['pretrain_idx']
-    pre_va = splits['folds'][0]['val_idx']
+    pre_rng = np.random.default_rng(CONFIG["SEED"])
+    pre_shuffled = splits['pretrain_idx'].copy()
+    pre_rng.shuffle(pre_shuffled)
+    if len(pre_shuffled) > 1:
+        pre_val_cut = int(round(CONFIG.get("PRETRAIN_VAL_RATIO", 0.1) * len(pre_shuffled)))
+        pre_val_cut = max(1, min(pre_val_cut, len(pre_shuffled) - 1))
+    else:
+        pre_val_cut = 0
+    pre_va = pre_shuffled[:pre_val_cut] if pre_val_cut else pre_shuffled[:]
+    pre_tr = pre_shuffled[pre_val_cut:] if pre_val_cut else pre_shuffled[:]
+    if not pre_va:
+        pre_va = pre_tr
 
     pre_train_dl = create_dataloader(dataset, CONFIG["BATCH_SIZE"], indices=pre_tr, shuffle=True,
                                      seed=CONFIG["SEED"], num_workers=CONFIG["NUM_WORKERS"],
@@ -189,6 +199,7 @@ def main():
     model = build_model(device, data_graph, num_subgraphs=num_subgraphs)
     _maybe_resize_embeddings(model, global_num_vertices, global_num_labels)
 
+    pretrain_checkpoint_loaded = False
     if os.path.exists(CONFIG["PRETRAIN_WEIGHTS"]):
         state = torch.load(CONFIG["PRETRAIN_WEIGHTS"], map_location=device)
         model_keys = {k.split("model.", 1)[1]: v for k, v in state.items() if k.startswith("model.")}
@@ -196,11 +207,13 @@ def main():
             model_keys = state
         _resize_to_fit_checkpoint(model, model_keys)
         model.load_state_dict(model_keys, strict=False)
+        pretrain_checkpoint_loaded = True
 
     pre_calibrator = OutputCalibrator() if CONFIG["USE_CALIBRATOR"] else None
-    y_pre_train = np.array([prepared['true_cardinalities'][i] for i in pre_tr], dtype=np.float64)
-    mu_pre = float((np.median if CONFIG["USE_MEDIAN_BIAS"] else np.mean)(np.log1p(y_pre_train))) if y_pre_train.size else 0.0
-    set_head_bias_to_mu(model, mu_pre)
+    if not pretrain_checkpoint_loaded:
+        y_pre_train = np.array([prepared['true_cardinalities'][i] for i in pre_tr], dtype=np.float64)
+        mu_pre = float((np.median if CONFIG["USE_MEDIAN_BIAS"] else np.mean)(np.log1p(y_pre_train))) if y_pre_train.size else 0.0
+        set_head_bias_to_mu(model, mu_pre)
 
     groups, base_params, _ = make_param_groups(model, CONFIG["LR"], CONFIG["WEIGHT_DECAY"],
                                                head_lr_mult=CONFIG["HEAD_LR_MULT"], calibrator=pre_calibrator,
