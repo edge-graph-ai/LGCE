@@ -26,7 +26,7 @@ class GraphEmbedding(nn.Module):
                 raise RuntimeError(
                     f"[GraphEmbedding:{where}] vertex_ids out of range "
                     f"(min={int(vertex_ids.min())}, max={vmax}, table={self.num_vertices_data}). "
-                    f"请确保 num_vertices_data 覆盖数据图全局ID范围，且子图用全局ID。"
+                    f"Ensure num_vertices_data covers the global ID range of the data graph and that subgraphs use global IDs."
                 )
         if labels is not None:
             if labels.dtype != torch.long:

@@ -40,7 +40,7 @@ class GINEncoder(nn.Module):
         self.use_residual = residual
         self.jk_mode = jk_mode = (jk_mode or "last").lower()
 
-        # --- 堆叠 GIN 层 ---
+        # --- Stack GIN layers ---
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
         self.drops = nn.ModuleList()
