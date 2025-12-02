@@ -100,7 +100,7 @@ def bind_output_paths_to_selected_num(config: Dict[str, Any]) -> Dict[str, Any]:
     dataset = config["DATASET"]
     num = config["SELECTED_QUERY_NUM"]
     variant = (config.get("MODEL_VARIANT") or "BASE").strip().lower().replace(" ", "_")
-    out_dir = os.path.join("ablation", dataset, variant, str(num))
+    out_dir = os.path.join("checkpoints", dataset, variant, str(num))
     os.makedirs(out_dir, exist_ok=True)
 
     config["PRETRAIN_WEIGHTS"] = os.path.join(out_dir, f"pretrained_q{num}.pth")
