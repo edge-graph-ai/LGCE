@@ -93,7 +93,6 @@ tests/__pycache__/
 tests/
 *ablation*/
 compare/
-data/
 *.graph
 *.txt
 *.pid
@@ -102,3 +101,14 @@ data/
 
 *.pdf
 *.svg
+!requirments.txt
+
+data/*
+
+!data/train_data/
+
+data/train_data/*
+
+!data/train_data/wordnet/
+
+!data/train_data/wordnet/**
