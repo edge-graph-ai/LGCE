@@ -95,13 +95,14 @@ tests/
 compare/
 *.graph
 *.txt
+!requirements.txt
 *.pid
 *.out
 
 
 *.pdf
 *.svg
-!requirments.txt
+
 
 data/*
 
