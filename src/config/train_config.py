@@ -9,7 +9,7 @@ except ImportError:  # pragma: no cover
 
 # Default configuration used by the training script.
 CONFIG: Dict[str, Any] = dict(
-    DATASET="yeast",
+    DATASET="wordnet",
     DATA_GRAPH=None,
     MATCHES_PATH=None,
     PREPARED_OUT=None,
@@ -21,8 +21,8 @@ CONFIG: Dict[str, Any] = dict(
 
     DEVICE="cuda",
     SEED=42,
-    BATCH_SIZE=64,
-    LR=1e-3,
+    BATCH_SIZE=8,
+    LR=1e-4,
     WEIGHT_DECAY=1e-4,
     EPOCHS_PRE=50,
     EPOCHS_FT=50,
