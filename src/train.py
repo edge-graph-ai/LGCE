@@ -75,9 +75,9 @@ def main():
     parser.add_argument("--disable-mem-pos", dest="enable_mem_pos", action="store_false",
                         help="Disable positional encodings for memory tokens")
     parser.add_argument("--variant", type=str, default=None,
-                        help="选择消融：BASE | NO_GIN | NO_ATTENTION | NO_GIN_NO_ATTENTION （兼容：NO_ENCODER | NO_DECODER）")
+                        help="Select ablation: BASE | NO_GIN | NO_ATTENTION | NO_GIN_NO_ATTENTION (aliases: NO_ENCODER | NO_DECODER)")
     parser.add_argument("--selected-query-num", type=int, default=None,
-                        help="Override CONFIG['SELECTED_QUERY_NUM'] (默认 24，例如 4、8、12 等)")
+                        help="Override CONFIG['SELECTED_QUERY_NUM'] (default 24; e.g., 4, 8, 12)")
     parser.set_defaults(enable_shortcut=None, enable_multi_scale=None, enable_cross_attn=None, enable_mem_pos=None)
     args = parser.parse_args()
 
@@ -95,7 +95,7 @@ def main():
 
     query_dir = resolve_query_dir(CONFIG["QUERY_ROOT"], CONFIG["QUERY_NUM_DIR"], CONFIG["QUERY_DIR"])
     if not os.path.exists(CONFIG["PREPARED_OUT"]):
-        print(f"[Info] {CONFIG['PREPARED_OUT']} 不存在，调用 prepare_data() 生成 …")
+        print(f"[Info] {CONFIG['PREPARED_OUT']} is missing; generating via prepare_data() ...")
         Path(CONFIG["PREPARED_OUT"]).parent.mkdir(parents=True, exist_ok=True)
         prepare_data(device=("cuda" if device.type == "cuda" else "cpu"),
                      data_graph_filename=CONFIG["DATA_GRAPH"],
@@ -103,7 +103,7 @@ def main():
                      matches_path=CONFIG["MATCHES_PATH"],
                      output_path=CONFIG["PREPARED_OUT"])
     else:
-        print(f"[Info] 使用已存在的 {CONFIG['PREPARED_OUT']}")
+        print(f"[Info] Using existing prepared dataset at {CONFIG['PREPARED_OUT']}")
 
     prepared = load_prepared_pyg(CONFIG["PREPARED_OUT"])
     dataset = build_dataset_from_prepared(prepared, repeat_idx=0)
@@ -226,7 +226,7 @@ def main():
                                             patience=CONFIG["PATIENCE"], device=device, best_path=CONFIG["BEST_PRE_PATH"],
                                             calibrator=pre_calibrator, warmup_head_epochs=0, base_params=base_params)
     torch.save(torch.nn.ModuleDict(dict(model=model, calibrator=pre_calibrator if pre_calibrator else torch.nn.Identity())).state_dict(), CONFIG["PRETRAIN_WEIGHTS"])
-    print(f"保存预训练权重 -> {CONFIG['PRETRAIN_WEIGHTS']}")
+    print(f"Saved pretrain weights -> {CONFIG['PRETRAIN_WEIGHTS']}")
 
     print("\n========== Stage 2: K-Fold Fine-tuning (only SELECTED_QUERY_NUM) ==========")
     fold_qerrs, fold_box_q3, fold_box_med = [], [], []

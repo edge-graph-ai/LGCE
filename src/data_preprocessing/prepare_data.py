@@ -13,9 +13,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-# 固定随机种子
-random.seed(42)
-np.random.seed(42)
+# Fix random seeds for reproducible preprocessing.
+random.seed(42); np.random.seed(42)
 torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
@@ -102,13 +101,13 @@ def prepare_data(
     # ===== 1. 读取数据图 =====
     t0 = time.perf_counter()
     data_graph = load_graph_from_file(str(data_graph_filename))
-    print(f"读取数据图运行时间: {time.perf_counter() - t0:.2f} 秒")
+    print(f"Elapsed time reading data graph: {time.perf_counter() - t0:.2f} s")
 
     # ===== 2. 收集查询图文件 =====
     t0 = time.perf_counter()
     query_files = glob.glob(str(query_graph_root / "**" / "*.graph"), recursive=True)
     query_files = sorted(query_files, key=lambda p: os.path.basename(p))
-    print(f"将读取 {len(query_files)} 个查询图（已按文件名排序）")
+    print(f"Loading {len(query_files)} query graphs (sorted by filename)")
 
     # 通过文件名提取 query_id
     query_ids = [os.path.splitext(os.path.basename(p))[0] for p in query_files]
@@ -116,9 +115,9 @@ def prepare_data(
     # ===== 3. 读取真实基数并对齐 =====
     t1 = time.perf_counter()
     true_cardinalities = load_true_cardinalities_aligned(str(matches_path), query_ids)
-    print(f"读取并对齐真实基数运行时间: {time.perf_counter() - t1:.2f} 秒")
+    print(f"Elapsed time reading and aligning true cardinalities: {time.perf_counter() - t1:.2f} s")
     assert len(true_cardinalities) == len(query_ids), \
-        f"数量不一致：labels={len(true_cardinalities)} vs queries={len(query_ids)}"
+        f"Count mismatch: labels={len(true_cardinalities)} vs queries={len(query_ids)}"
 
     # ===== 4. 统计数据图中顶点类型分布 =====
     t0 = time.perf_counter()
@@ -126,21 +125,18 @@ def prepare_data(
     for attrs in data_graph.vertices.values():
         lbl = attrs['label']
         vertex_label_counts[lbl] = vertex_label_counts.get(lbl, 0) + 1
-    print(f"统计顶点类型分布运行时间: {time.perf_counter() - t0:.2f} 秒")
+    print(f"Elapsed time counting vertex label distribution: {time.perf_counter() - t0:.2f} s")
 
     # ===== 5. 查询图转为 PyG Data =====
     t2 = time.perf_counter()
     query_graphs = [load_graph_from_file(p) for p in query_files]
-    pyg_query_graphs = [
-        graphdata_to_pyg_data(qg, device, "query graph")
-        for qg in query_graphs
-    ]
-    print(f"查询图转换为 PyG 的 Data 对象运行时间: {time.perf_counter() - t2:.2f} 秒")
+    pyg_query_graphs = [graphdata_to_pyg_data(qg, device, "query graph") for qg in query_graphs]
+    print(f"Elapsed time converting query graphs to PyG Data: {time.perf_counter() - t2:.2f} s")
 
     # ===== 6. 划分数据图为子图并转为 PyG =====
     t3 = time.perf_counter()
     np.random.seed(seed)
-    print(f"划分为 {subgraph_num} 个子图，重复 {repeats} 次")
+    print(f"Partitioning into {subgraph_num} subgraphs, repeated {repeats} times")
     data_graphs = [partition_graph_bfs(data_graph, subgraph_num) for _ in range(repeats)]
 
     pyg_data_graphs = []
@@ -151,7 +147,7 @@ def prepare_data(
                 continue
             pyg_subgraphs.append(graphdata_to_pyg_data(subg, device, "data graph"))
         pyg_data_graphs.append(pyg_subgraphs)
-    print(f"随机划分数据图运行时间: {time.perf_counter() - t3:.2f} 秒")
+    print(f"Elapsed time partitioning data graphs: {time.perf_counter() - t3:.2f} s")
 
     # ===== 7. 保存结果 =====
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -162,7 +158,7 @@ def prepare_data(
         'query_ids': query_ids,                    # [num_queries]
         'dataset': dataset,
     }, str(output_path))
-    print(f"所有处理结果已保存到 {output_path}")
+    print(f"All processed results saved to {output_path}")
 
     # 单独保存一份数据图信息（只保留一个划分）
     sample_pyg_data_graphs = [pyg_data_graphs[0]]
@@ -173,7 +169,7 @@ def prepare_data(
         'vertex_label_counts': vertex_label_counts,
         'dataset': dataset,
     }, str(graph_info_out))
-    print(f"数据图已保存到 {graph_info_out}（仅一次划分）")
+    print(f"Data graph snapshot saved to {graph_info_out} (single partition)")
 
     return pyg_data_graphs, pyg_query_graphs, true_cardinalities
 

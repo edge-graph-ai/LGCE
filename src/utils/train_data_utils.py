@@ -17,19 +17,19 @@ def resolve_query_dir(query_root: str, query_num_dir: int | None, query_dir: str
     """Resolve the directory that contains query graphs and validate availability."""
     if query_dir:
         qdir = query_dir
-        print(f"[QueryDir] 使用显式目录: {qdir}")
+        print(f"[QueryDir] Using explicit directory: {qdir}")
     elif query_num_dir is not None:
         qdir = os.path.join(query_root, f"query_{query_num_dir}")
-        print(f"[QueryDir] 由 QUERY_NUM_DIR 计算得到: {qdir}")
+        print(f"[QueryDir] Derived directory from QUERY_NUM_DIR: {qdir}")
     else:
         qdir = query_root
-        print(f"[QueryDir] 未指定 QUERY_DIR/QUERY_NUM_DIR，使用根目录（递归读取）: {qdir}")
+        print(f"[QueryDir] QUERY_DIR/QUERY_NUM_DIR not set; using root directory (recursive scan): {qdir}")
     if not os.path.isdir(qdir):
-        raise RuntimeError(f"查询目录不存在: {qdir}")
+        raise RuntimeError(f"Query directory does not exist: {qdir}")
     n_graphs = len(glob.glob(os.path.join(qdir, "**", "*.graph"), recursive=True))
     if n_graphs == 0:
-        raise RuntimeError(f"查询目录下未发现 .graph 文件: {qdir}")
-    print(f"[QueryDir] 发现 {n_graphs} 个 .graph 查询文件")
+        raise RuntimeError(f"No .graph files found under the query directory: {qdir}")
+    print(f"[QueryDir] Found {n_graphs} .graph query files")
     return qdir
 
 
