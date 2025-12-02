@@ -4,7 +4,7 @@ set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 SCRIPT="${SCRIPT:-train.py}"
-DATASET="${DATASET:-yeast}"
+DATASET="${DATASET:-wordnet}"
 
 
 LOG_DIR="${LOG_DIR:-logs}"
