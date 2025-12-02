@@ -9,7 +9,7 @@ except ImportError:  # pragma: no cover
 
 # Default configuration used by the training script.
 CONFIG: Dict[str, Any] = dict(
-    DATASET="yeast",
+    DATASET="wordnet",
     DATA_GRAPH=None,
     MATCHES_PATH=None,
     PREPARED_OUT=None,
@@ -21,8 +21,8 @@ CONFIG: Dict[str, Any] = dict(
 
     DEVICE="cuda",
     SEED=42,
-    BATCH_SIZE=64,
-    LR=1e-3,
+    BATCH_SIZE=8,
+    LR=1e-4,
     WEIGHT_DECAY=1e-4,
     EPOCHS_PRE=50,
     EPOCHS_FT=50,
@@ -100,7 +100,7 @@ def bind_output_paths_to_selected_num(config: Dict[str, Any]) -> Dict[str, Any]:
     dataset = config["DATASET"]
     num = config["SELECTED_QUERY_NUM"]
     variant = (config.get("MODEL_VARIANT") or "BASE").strip().lower().replace(" ", "_")
-    out_dir = os.path.join("ablation", dataset, variant, str(num))
+    out_dir = os.path.join("checkpoints", dataset, variant, str(num))
     os.makedirs(out_dir, exist_ok=True)
 
     config["PRETRAIN_WEIGHTS"] = os.path.join(out_dir, f"pretrained_q{num}.pth")

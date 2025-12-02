@@ -7,7 +7,7 @@ SCRIPT="${SCRIPT:-train.py}"
 DATASET="${DATASET:-yeast}"
 
 
-LOG_DIR="${LOG_DIR:-anotherablation}"
+LOG_DIR="${LOG_DIR:-logs}"
 
 
 # base / no_gin / no_encoder / no_decoder / no_gin_no_attention

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 import time
 import math
@@ -19,6 +19,11 @@ torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
 
+THIS_FILE = Path(__file__).resolve()
+
+PROJECT_ROOT = THIS_FILE.parents[2]
+DEFAULT_DATA_ROOT = PROJECT_ROOT / "data" / "train_data"
+
 from src.data_preprocessing.graphdata_to_pyg_data import graphdata_to_pyg_data
 from src.data_preprocessing.load_data import (
     load_graph_from_file,
@@ -28,9 +33,19 @@ from src.data_preprocessing.substrate_data_graph import (
     partition_graph_bfs,  
 )
 
-def _build_default_paths(dataset: str, data_root: str = "../../data/train_data"):
 
-    base = Path(data_root) / dataset
+def _build_default_paths(dataset: str, data_root: str | Path = DEFAULT_DATA_ROOT):
+    """
+    根据 dataset 名字和 data_root 构造默认的数据路径。
+    data_root 默认指向: <PROJECT_ROOT>/data/train_data
+    """
+    data_root = Path(data_root).resolve()
+    base = data_root / dataset
+
+
+    print(data_root)
+    print(base / "query_graph")
+
     return {
         "data_graph_filename": base / "data_graph" / f"{dataset}.graph",
         "query_graph_root":    base / "query_graph",
@@ -39,33 +54,37 @@ def _build_default_paths(dataset: str, data_root: str = "../../data/train_data")
         "graph_info_out":      base / "prepared_pyg_data_graph.pt",
     }
 
+
 def prepare_data(
     *,
-    dataset: str = "hprd",
-    data_root: str = "../../data/train_data",
+    dataset: str = "wordnet",
+    data_root: str | Path = DEFAULT_DATA_ROOT,
     device: str = "cuda",
 
-   
+
     data_graph_filename: str | Path | None = None,
     query_graph_root: str | Path | None = None,
     matches_path: str | Path | None = None,
     output_path: str | Path | None = None,
 
-    
-    subgraph_num: int = 64,
+
+    subgraph_num: int = 8,
     repeats: int = 1,
     seed: int = 42,
 
-    
     **kwargs,
 ):
-    
+
+
     defaults = _build_default_paths(dataset, data_root)
+
+
     data_graph_filename = Path(data_graph_filename or defaults["data_graph_filename"])
     query_graph_root    = Path(query_graph_root    or defaults["query_graph_root"])
     matches_path        = Path(matches_path        or defaults["matches_path"])
     output_path         = Path(output_path         or defaults["output_path"])
     graph_info_out      = Path(defaults["graph_info_out"])
+
 
     print(f"[INFO] dataset      = {dataset}")
     print(f"[INFO] data_root    = {Path(data_root).resolve()}")
@@ -74,18 +93,15 @@ def prepare_data(
     print(f"[INFO] matches_path = {matches_path.resolve()}")
     print(f"[INFO] output_path  = {output_path.resolve()}")
 
-    
     t0 = time.perf_counter()
     data_graph = load_graph_from_file(str(data_graph_filename))
     print(f"Elapsed time reading data graph: {time.perf_counter() - t0:.2f} s")
 
-    
     t0 = time.perf_counter()
     query_files = glob.glob(str(query_graph_root / "**" / "*.graph"), recursive=True)
     query_files = sorted(query_files, key=lambda p: os.path.basename(p))
     print(f"Loading {len(query_files)} query graphs (sorted by filename)")
 
-   
     query_ids = [os.path.splitext(os.path.basename(p))[0] for p in query_files]
 
 
@@ -114,6 +130,7 @@ def prepare_data(
     np.random.seed(seed)
     print(f"Partitioning into {subgraph_num} subgraphs, repeated {repeats} times")
     data_graphs = [partition_graph_bfs(data_graph, subgraph_num) for _ in range(repeats)]
+
     pyg_data_graphs = []
     for subgraphs in data_graphs:
         pyg_subgraphs = []
@@ -149,15 +166,12 @@ def prepare_data(
     return pyg_data_graphs, pyg_query_graphs, true_cardinalities
 
 
-
 if __name__ == "__main__":
-    
-    DATASET = "hprd"
 
+    DATASET = "hprd"
 
     prepare_data(
         dataset=DATASET,
-        data_root="../../data/train_data",  
         device="cuda",
         subgraph_num=8,
         repeats=1,
