@@ -46,6 +46,7 @@ def main():
     """Parse CLI flags, prepare data, then run pretraining and K-fold fine-tuning."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config file overriding defaults")
+    parser.add_argument("--dataset", type=str, default=None, help="Dataset name under ../data/train_data/<dataset>")
     parser.add_argument("--enable-shortcut", dest="enable_shortcut", action="store_true",
                         help="Force enable embed shortcut gating")
     parser.add_argument("--disable-shortcut", dest="enable_shortcut", action="store_false",

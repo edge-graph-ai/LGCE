@@ -97,12 +97,10 @@ def prepare_data(
     data_graph = load_graph_from_file(str(data_graph_filename))
     print(f"Elapsed time reading data graph: {time.perf_counter() - t0:.2f} s")
 
-
     t0 = time.perf_counter()
     query_files = glob.glob(str(query_graph_root / "**" / "*.graph"), recursive=True)
     query_files = sorted(query_files, key=lambda p: os.path.basename(p))
     print(f"Loading {len(query_files)} query graphs (sorted by filename)")
-
 
     query_ids = [os.path.splitext(os.path.basename(p))[0] for p in query_files]
 

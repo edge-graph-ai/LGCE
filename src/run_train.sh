@@ -4,6 +4,7 @@ set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 SCRIPT="${SCRIPT:-train.py}"
+DATASET="${DATASET:-yeast}"
 
 
 LOG_DIR="${LOG_DIR:-logs}"
@@ -21,6 +22,7 @@ mkdir -p "$LOG_DIR"
 echo "== Ablation runner =="
 echo "Python  : $PYTHON_BIN"
 echo "Script  : $SCRIPT"
+echo "Dataset : $DATASET"
 echo "Logs    : $LOG_DIR"
 echo "Variants: ${VARIANTS[*]}"
 echo "QNUMs   : ${QNUMS[*]}"
@@ -41,6 +43,7 @@ run_one() {
 
   (
     time "$PYTHON_BIN" "$SCRIPT" \
+      --dataset "$DATASET" \
       --variant "$variant" \
       --selected-query-num "$qnum"
   ) 2>&1 | tee "$log_file"

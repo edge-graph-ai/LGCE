@@ -132,6 +132,8 @@ def apply_cli_overrides(args, config: Dict[str, Any] = CONFIG) -> None:
         return
     if getattr(args, "config", None):
         config.update(load_yaml_config(args.config))
+    if getattr(args, "dataset", None):
+        config["DATASET"] = str(args.dataset)
     if getattr(args, "enable_shortcut", None) is not None:
         config["ENABLE_EMBED_SHORTCUT"] = bool(args.enable_shortcut)
     if getattr(args, "shortcut_init", None) is not None:
