@@ -22,15 +22,15 @@ Tested with:
 - PyTorch Geometric (PyG)
 
 Clone the repository and install dependencies:
-git clone https://github.com/edge-graph-ai/LGCE.git
-cd LGCE
-pip install -r requirements.txt
+- git clone https://github.com/edge-graph-ai/LGCE.git
+- cd LGCE
+- pip install -r requirements.txt
 
 ---
 ## Train
 
-cd src
-bash run_train.sh
+- cd src
+- bash run_train.sh
 
 This repository provides a prepared **WordNet** dataset so that you can directly train the model and obtain results on this dataset.  
 For more datasets, please refer to: https://github.com/RapidsAtHKUST/SubgraphMatching
